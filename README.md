@@ -1,18 +1,17 @@
 # even-better
 
-Mirror a terminal coding-agent session (Claude Code or Codex) onto **Even
-Realities G2** glasses. even-better speaks the same HTTP/SSE protocol as
-`@evenrealities/even-terminal`, so the stock Even App connects by scanning a QR
-code — but instead of spawning a new agent, it **mirrors an agent you're already
-running inside a terminal multiplexer** ([herdr](https://herdr.dev) or
-[cmux](https://github.com/manaflow-ai/cmux)). The terminal session and the
-glasses are the same process: what you see in the pane streams to the glasses,
-and prompts from the glasses are typed into the pane.
+Use a coding-agent session from **Even Realities G2** glasses. even-better
+speaks the same HTTP/SSE protocol as `@evenrealities/even-terminal`, so the
+stock Even App connects by scanning a QR code. Its default `mux` source mirrors
+Claude Code or Codex already running in [herdr](https://herdr.dev) or
+[cmux](https://github.com/manaflow-ai/cmux). Its opt-in `grok` source instead
+owns one complete [ACP](https://agentclientprotocol.com/) session launched with
+`grok agent stdio` in a working directory you choose.
 
 ```
-┌── herdr / cmux ───────┐      ┌── even-better ─────────┐      ┌── Even App ──┐
+┌── session source ─────┐      ┌── even-better ─────────┐      ┌── Even App ──┐
 │ claude / codex panes  │◄────►│ HTTP + SSE             │◄────►│  → G2 glasses │
-│ (your live sessions)  │socket│ even-terminal protocol │ WiFi │              │
+│ or Grok ACP child     │ stdio│ even-terminal protocol │ WiFi │              │
 └───────────────────────┘      └────────────────────────┘      └──────────────┘
 ```
 
@@ -25,13 +24,14 @@ and prompts from the glasses are typed into the pane.
 
 ## Prerequisites
 
-- **macOS** (primary target), with one terminal multiplexer running and at least
-  one `claude` or `codex` agent live in a pane — even-better mirrors those; it
-  never spawns an agent itself. Either:
+- **Node.js ≥ 18** and **pnpm**.
+- For the default mux source: **macOS** (primary target), with one terminal
+  multiplexer running and at least one `claude` or `codex` agent live in a pane:
   - **[herdr](https://herdr.dev)**, or
   - **[cmux](https://github.com/manaflow-ai/cmux)** (agent hooks must be
     installed — Claude Code is automatic, Codex needs `cmux hooks codex install`).
-- **Node.js ≥ 18** and **pnpm**.
+- For the Grok source: Grok CLI **0.2.103 or newer**, authenticated by
+  `XAI_API_KEY` or `grok login`. No multiplexer is used.
 - **Even Realities G2** glasses paired with the **Even App** on your phone.
 - For remote access: the matching CLI (`tailscale`, `cloudflared`, `ngrok`,
   `bore`, or the built-in `ssh` for pinggy) — see [Remote access](#remote-access-off-your-wi-fi).
@@ -48,19 +48,29 @@ glasses are typed into the pane; the agent's replies stream back.
 
 If both herdr and cmux are running, pick one with `MUX=herdr` or `MUX=cmux`.
 
+To launch one new Grok ACP session instead:
+
+```bash
+SOURCE=grok GROK_CWD="$PWD" pnpm start
+```
+
+Grok starts before the HTTP server. If its version, authentication, or working
+directory is invalid, even-better exits with an actionable error and prints no
+connection QR. See [docs/GROK.md](docs/GROK.md).
+
 ## What it does
 
-- **Mirrors, never spawns.** No extra agent process and no extra token spend
-  beyond what your terminal session already uses. Model, permission mode, and
-  everything else follow whatever the pane's agent is configured with.
-- **Lossless output.** It reads the agent's structured session transcript
-  (Claude/Codex jsonl) as the source of truth, so what reaches the glasses
-  matches the pane without screen-scraping guesswork. (Until that transcript is
-  available — a fresh agent before its session exists — it streams no content
-  yet, rather than scraping the screen.)
+- **Mux stays mirror-only.** The default source keeps the existing Claude/Codex
+  panes and token usage unchanged.
+- **Grok is explicit and owned.** `SOURCE=grok` launches one `grok agent stdio`
+  child and closes it when even-better shuts down. It never mirrors Grok's TUI.
+- **Structured output.** Mux mode reads Claude/Codex session transcripts as its
+  source of truth; Grok mode consumes validated ACP frames. Neither coding-agent
+  path screen-scrapes prose. (A fresh mux agent streams no content until its
+  transcript exists.)
 - **Interactive.** Permission prompts and questions become menus on the glasses
-  you can answer; the answer is sent back into the pane. Prompts and interrupts
-  from the glasses drive the same pane.
+  you can answer. Prompts and interrupts drive the selected pane or owned Grok
+  session.
 
 For how this is built, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -70,7 +80,13 @@ Everything is optional — `pnpm start` works with no flags.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
+| `SOURCE` | `mux` | Session source: existing `mux` mirroring or one owned `grok` ACP session |
 | `MUX` | auto | Multiplexer backend: `herdr` or `cmux`. Auto-detects; if both are present, prompts on a TTY (set this to choose) |
+| `GROK_CWD` | – | Required with `SOURCE=grok`: accessible working directory for the new Grok session |
+| `GROK_BIN` | `grok` | Grok executable name or path |
+| `GROK_STARTUP_TIMEOUT_MS` | `15000` | Total deadline for version check, ACP initialization, authentication, and session creation |
+| `GROK_CANCEL_TIMEOUT_MS` | `5000` | How long interruption may take before the owned Grok process is terminated |
+| `GROK_SHUTDOWN_TIMEOUT_MS` | `2000` | Per-stage shutdown deadline before escalating from EOF to TERM to KILL |
 | `PORT` | `auto` | HTTP port. Unset/`auto`/`0` asks the OS for a free port; set a number only when you need a fixed one |
 | `BIND_HOST` | `auto` | Local bind/QR host: `auto`, `lan`, `local`, `tailscale`, or a literal IP. `PUBLIC_ACCESS` requires `auto` or loopback |
 | `PUBLIC_ACCESS` | `none` | Public access provider: `none`, `tailscale-funnel`, `pinggy`, `bore`, `ngrok`, `cloudflared` |
@@ -118,12 +134,14 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 ## Caveats
 
 - Cost isn't computed (token counts are reported; `costUsd` is always 0).
+- The Grok source is one fresh in-memory session per even-better launch. It does
+  not resume persisted sessions or run concurrent Grok sessions.
 - A claude/codex pane shows content only from its structured transcript — a fresh
   agent shows nothing until its session's jsonl exists (no lossy screen scraping).
 - Permission menus are read from the screen; exotic prompts fall back to a
   "check your terminal" notification.
-- even-better only *mirrors* — it won't start a brand-new session from the
-  glasses; it picks the focused pane.
+- In mux mode, even-better only mirrors and picks the focused pane. In Grok mode,
+  the single new session is the only session exposed to the glasses.
 
 ## Contributing
 

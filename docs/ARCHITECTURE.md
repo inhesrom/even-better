@@ -7,9 +7,9 @@ about" at the end.
 
 ## What this system actually is
 
-One sentence: **it turns a live coding-agent-in-a-terminal into a
-provider-neutral event stream, and renders that stream onto a tiny remote
-display while relaying input back.**
+One sentence: **it turns a live coding-agent session—either mirrored from a
+terminal or owned over ACP—into a provider-neutral event stream, and renders
+that stream onto a tiny remote display while relaying input back.**
 
 That sentence names the real center of the design — the *event stream*.
 Everything upstream of it exists to **produce** the stream; everything
@@ -25,6 +25,36 @@ seams belong only where a second real implementation is coming.
   └───────────────────┘ ◄─── └────────────────┘  ◄─── └──────────────────┘
      prompt / respond / interrupt          replay / status
 ```
+
+## Implemented runtime source boundary
+
+`SOURCE=mux` (the default) and `SOURCE=grok` are selected once at launch. HTTP
+routes depend on the small `SessionCatalog` / `LiveSession` boundary in
+`src/session.ts`, rather than knowing how a session is produced.
+
+```text
+                       SessionCatalog / LiveSession
+                      ┌─────────────────────────────┐
+MuxSessionCatalog ───►│ list, get, prompt, respond, │◄─── GrokSessionCatalog
+  └─ PaneBridge       │ interrupt, state, dispose   │       └─ GrokSessionBridge
+                      └──────────────┬──────────────┘          └─ GrokAcpProcess
+                                     │
+                              HTTP/SSE protocol
+```
+
+This boundary is intentionally narrower than the aspirational event-spine
+design below. It lets the ACP implementation coexist with `PaneBridge` without
+refactoring the mature Claude/Codex transcript and multiplexer paths. The mux
+adapter delegates to the existing bridge manager; the Grok adapter owns exactly
+one child and one session.
+
+The Grok producer is split into three concrete responsibilities:
+
+- `grok-acp-process.ts`: child ownership, ACP SDK transport, private IDs,
+  authentication, cancellation, and shutdown
+- `grok-acp-normalize.ts`: exhaustive ACP/Grok-extension normalization
+- `grok-bridge.ts`: even-terminal event ordering, interaction state, prose
+  pacing, tools, usage, and terminal result synthesis
 
 ## The spine: a provider-neutral event vocabulary
 
@@ -177,7 +207,7 @@ filtering, menu parsing, key grammar, herdr calls, wire formatting — every one
 of them now has a home on the producer or consumer side. The core is just the
 turn state machine.
 
-## Target module layout
+## Longer-term target module layout
 
 ```
 src/

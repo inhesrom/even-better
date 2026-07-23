@@ -1,25 +1,15 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
-import path from "node:path";
 import readline from "node:readline";
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import cors from "cors";
-import {
-  disposeAll,
-  focusedOrFirstBridge,
-  getBridge,
-  getOrCreateBridge,
-  refreshAgents,
-} from "./bridge.js";
+import { getBridge } from "./bridge.js";
 import { emit, getMessages, sseHandler } from "./sse.js";
 import { getMux, setMux, type Multiplexer } from "./multiplexer.js";
 import { HerdrMultiplexer, herdrAvailable } from "./herdr.js";
 import { CmuxMultiplexer, cmuxAvailable } from "./cmux.js";
 import { logEvent, eventLogPath, logMode, writesEventLog, consoleLogPath, installConsoleTee } from "./log.js";
-import { extractModel } from "./parse.js";
-import { readClaudeModel } from "./transcript.js";
-import { readCodexModel } from "./codex-transcript.js";
 import { startExpose, exposeProviderNames } from "./expose.js";
 import { startHookEndpoint, hookSocketPath } from "./hook-endpoint.js";
 import {
@@ -32,6 +22,10 @@ import {
   hooksInstalled,
 } from "./hook-install.js";
 import { maskToken, printConnect } from "./connect-url.js";
+import { resolveGrokConfig, resolveSource, type SourceMode } from "./grok-config.js";
+import { GrokSessionCatalog } from "./grok-session-catalog.js";
+import { MuxSessionCatalog } from "./mux-session-catalog.js";
+import { SessionControlError, type ProviderId, type SessionCatalog } from "./session.js";
 
 // Tee the terminal diagnostics to a file before anything logs, so the lines needed to
 // diagnose a live issue are on disk without re-running with a flag.
@@ -135,7 +129,14 @@ async function selectMux(): Promise<Multiplexer> {
   return promptMux(found);
 }
 
-setMux(await selectMux());
+let sourceMode: SourceMode;
+try {
+  sourceMode = resolveSource(process.env);
+} catch (err) {
+  console.error(`error: ${(err as Error).message}`);
+  process.exit(1);
+}
+let catalog!: SessionCatalog;
 
 // The bearer token is process-local by default. Set BRIDGE_TOKEN explicitly
 // only when a stable token is wanted for a specific launch.
@@ -144,10 +145,11 @@ function resolveToken(): string {
   return randomBytes(24).toString("hex");
 }
 const TOKEN = resolveToken();
-let defaultProvider = "claude";
+let defaultProvider: ProviderId = sourceMode === "grok" ? "grok" : "claude";
 
-function providerForAgent(agent: string | undefined): "codex" | "claude" {
-  return agent === "codex" ? "codex" : "claude";
+function controlError(res: Response, err: unknown): void {
+  const status = err instanceof SessionControlError ? err.status : 500;
+  res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
 }
 
 function normalizeBasePath(raw: string | undefined): string {
@@ -264,27 +266,24 @@ api.get("/events", (req, res) => {
   // events are only emitted on transitions).
   const sessionId = req.query.sessionId as string | undefined;
   if (sessionId) {
-    const bridge = getBridge(sessionId);
-    if (bridge) {
-      emit(sessionId, {
-        type: "status",
-        state: bridge.state,
-        sessionId,
-      });
-    }
+    void catalog
+      .get(sessionId)
+      .then((session) => {
+        if (session) emit(sessionId, { type: "status", state: session.state, sessionId });
+      })
+      .catch(() => undefined);
   }
 });
 
 api.get("/sessions", async (_req, res) => {
   try {
-    const agents = await refreshAgents();
-    const sessions = agents.map((a) => ({
-      id: a.paneId,
-      title: `${a.agent} · ${path.basename(a.cwd || "/")}`,
-      timestamp: new Date().toISOString(),
-      cwd: a.cwd,
-      provider: providerForAgent(a.agent),
-      status: getBridge(a.paneId)?.state ?? "idle",
+    const sessions = (await catalog.list()).map((session) => ({
+      id: session.id,
+      title: session.title,
+      timestamp: session.timestamp,
+      cwd: session.cwd,
+      provider: session.provider,
+      status: session.status,
     }));
     res.json({ sessions });
   } catch (err) {
@@ -293,30 +292,19 @@ api.get("/sessions", async (_req, res) => {
 });
 
 api.get("/info", async (_req, res) => {
-  let model = "";
-  let provider: "codex" | "claude" = "claude";
+  let model = "Unknown";
+  let provider: ProviderId = defaultProvider;
   try {
-    const agents = await refreshAgents();
-    const target = agents.find((a) => a.focused) ?? agents[0];
-    provider = providerForAgent(target?.agent);
-    // Prefer the structured model from the transcript (works for codex too, and
-    // is exact); fall back to the claude status-bar scrape only if no session id
-    // exists yet.
-    if (target?.sessionId) {
-      model =
-        (target.agent === "codex"
-          ? readCodexModel(target.sessionId)
-          : readClaudeModel(target.sessionId)) ?? "";
-    }
-    if (!model && target?.agent === "claude") {
-      model = extractModel(await getMux().read(target.paneId, 5));
-    }
+    const info = await catalog.info();
+    model = info.model;
+    provider = info.provider;
+    defaultProvider = provider;
   } catch {
     // leave model unknown
   }
   res.json({
     account: {},
-    model: model || "Unknown",
+    model,
     version: `${VERSION} (even-better)`,
     provider,
   });
@@ -340,20 +328,16 @@ api.post("/prompt", async (req, res) => {
     return;
   }
   try {
-    let bridge = sessionId ? await getOrCreateBridge(sessionId) : undefined;
-    if (!bridge) {
-      const agents = await refreshAgents();
-      bridge = focusedOrFirstBridge(agents);
-    }
-    if (!bridge) {
+    const session = sessionId ? await catalog.get(sessionId) : await catalog.default();
+    if (!session) {
       res.status(404).json({ error: "No agent pane found" });
       return;
     }
-    console.log(`[prompt] pane=${bridge.paneId} text=${text.slice(0, 80)}`);
-    await bridge.prompt(text);
-    res.status(202).json({ ok: true, sessionId: bridge.paneId, provider: bridge.provider });
+    console.log(`[prompt] session=${session.id} text=${text.slice(0, 80)}`);
+    await session.prompt(text);
+    res.status(202).json({ ok: true, sessionId: session.id, provider: session.provider });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    controlError(res, err);
   }
 });
 
@@ -366,13 +350,17 @@ api.post("/permission-response", async (req, res) => {
     res.status(400).json({ error: "Missing 'sessionId'" });
     return;
   }
-  const bridge = getBridge(sessionId);
-  if (!bridge) {
-    res.status(404).json({ error: "Session not found" });
-    return;
+  try {
+    const session = await catalog.get(sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    await session.respondPermission(decision || "deny");
+    res.json({ ok: true });
+  } catch (err) {
+    controlError(res, err);
   }
-  await bridge.respondPermission(decision || "deny");
-  res.json({ ok: true });
 });
 
 api.post("/question-response", async (req, res) => {
@@ -384,13 +372,17 @@ api.post("/question-response", async (req, res) => {
     res.status(400).json({ error: "Missing 'sessionId'" });
     return;
   }
-  const bridge = getBridge(sessionId);
-  if (!bridge) {
-    res.status(404).json({ error: "Session not found" });
-    return;
+  try {
+    const session = await catalog.get(sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    await session.respondQuestion(answer || "skip");
+    res.json({ ok: true });
+  } catch (err) {
+    controlError(res, err);
   }
-  await bridge.respondQuestion(answer || "skip");
-  res.json({ ok: true });
 });
 
 api.post("/interrupt", async (req, res) => {
@@ -399,43 +391,55 @@ api.post("/interrupt", async (req, res) => {
     res.status(400).json({ error: "Missing 'sessionId'" });
     return;
   }
-  const bridge = getBridge(sessionId);
-  if (!bridge) {
-    res.status(404).json({ error: "Session not found" });
-    return;
+  try {
+    const session = await catalog.get(sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    await session.interrupt();
+    res.json({ ok: true });
+  } catch (err) {
+    controlError(res, err);
   }
-  await bridge.interrupt();
-  res.json({ ok: true });
 });
 
-api.get("/status", (req, res) => {
+api.get("/status", async (req, res) => {
   const sessionId = req.query.sessionId as string | undefined;
   if (!sessionId) {
     res.status(400).json({ error: "Missing 'sessionId'" });
     return;
   }
-  const bridge = getBridge(sessionId);
-  if (!bridge) {
-    res.status(404).json({ error: "Session not found" });
-    return;
+  try {
+    const session = await catalog.get(sessionId);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    res.json({ state: session.state, sessionId, provider: session.provider });
+  } catch (err) {
+    controlError(res, err);
   }
-  res.json({ state: bridge.state, sessionId, provider: bridge.provider });
 });
 
-api.get("/messages", (req, res) => {
+api.get("/messages", async (req, res) => {
   const sessionId = req.query.sessionId as string | undefined;
   const after = parseInt((req.query.after as string) ?? "0", 10) || 0;
   if (!sessionId) {
     res.status(400).json({ error: "Missing 'sessionId'" });
     return;
   }
-  const bridge = getBridge(sessionId);
-  res.json({
-    messages: getMessages(sessionId, after),
-    state: bridge?.state ?? "idle",
-    sessionId,
-    provider: bridge?.provider ?? null,
-  });
+  try {
+    const session = await catalog.get(sessionId);
+    res.json({
+      messages: getMessages(sessionId, after),
+      state: session?.state ?? "idle",
+      sessionId,
+      provider: session?.provider ?? null,
+    });
+  } catch (err) {
+    controlError(res, err);
+  }
 });
 
 api.get("/sessions/:id/history", (_req, res) => {
@@ -503,13 +507,27 @@ function resolveBind(): Bind {
 
 const bind = resolveBind();
 
+// Start external resources only after every static launch setting has passed
+// validation, so a configuration error cannot orphan a detached Grok child.
+try {
+  if (sourceMode === "mux") {
+    setMux(await selectMux());
+    catalog = new MuxSessionCatalog();
+  } else {
+    catalog = await GrokSessionCatalog.start(resolveGrokConfig(process.env));
+  }
+} catch (err) {
+  console.error(`error: ${(err as Error).message}`);
+  process.exit(1);
+}
+
 const server = app.listen(listenPort, bind.bindHost, async () => {
   const address = server.address();
   const actualPort = typeof address === "object" && address ? address.port : listenPort;
   console.log("");
   console.log(`  even-better v${VERSION}`);
   console.log(`  Instance : ${INSTANCE_ID}`);
-  console.log(`  Mux      : ${getMux().name}`);
+  console.log(`  Source   : ${sourceMode === "mux" ? `mux (${getMux().name})` : "grok (ACP stdio)"}`);
   console.log(`  Bind     : ${bind.label}`);
   console.log(`  Local    : http://${bind.bindHost === "0.0.0.0" ? "127.0.0.1" : bind.bindHost}:${actualPort}`);
   if (basePaths.length > 0) console.log(`  Paths    : ${basePaths.join(", ")}`);
@@ -520,61 +538,67 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
   if (logMode !== "off") console.log(`  Diag log : ${consoleLogPath}`);
   console.log("");
   try {
-    const agents = await refreshAgents();
-    const target = agents.find((a) => a.focused) ?? agents[0];
-    defaultProvider = providerForAgent(target?.agent);
-    for (const a of agents) {
-      console.log(`  agent : ${a.agent} pane=${a.paneId} status=${a.status} cwd=${a.cwd}`);
+    const sessions = await catalog.list();
+    defaultProvider = (await catalog.info()).provider;
+    for (const session of sessions) {
+      console.log(
+        `  agent : ${session.provider} session=${session.id} status=${session.status} cwd=${session.cwd}`,
+      );
     }
-    if (agents.length === 0) {
+    if (sessions.length === 0 && sourceMode === "mux") {
       console.log(`  agent : none yet — start claude or codex inside ${getMux().name}; it's picked up automatically (no restart).`);
     }
   } catch (err) {
-    console.error(`  ${getMux().name} : NOT REACHABLE — ${(err as Error).message}`);
+    const source = sourceMode === "mux" ? getMux().name : "grok ACP";
+    console.error(`  ${source} : NOT REACHABLE — ${(err as Error).message}`);
   }
 
   // Receive self-hook reports. With SELF_HOOK=1 (Stage 3) they drive the matching
   // bridge's status/session via the per-pane cutover; off by default (log-only).
   // Install with `pnpm start hook-install`; remove with `hook-uninstall`.
   const selfHook = process.env.SELF_HOOK === "1";
-  try {
-    await startHookEndpoint((r) => {
-      const extra = [
-        r.sessionId ? `session=${r.sessionId}` : "",
-        r.toolName ? `tool=${r.toolName}` : "",
-        r.transcriptPath ? "hasPath" : "",
-      ].filter(Boolean).join(" ");
-      const pane = r.paneId || `pid:${r.pid ?? "?"}`;
-      console.log(`  [hook] ${r.mux}/${pane} ${r.agent} ${r.event} seq=${r.seq}${extra ? " " + extra : ""}`);
-      if (selfHook && r.paneId) {
-        // Env-primary routing: r.paneId == the mux paneId. (pid fallback for env-less
-        // reports + reconciliation land in Stage 3b.)
-        getBridge(r.paneId)?.onHookReport(r);
+  if (sourceMode === "grok") {
+    console.log("  Hooks    : not used by the Grok ACP source");
+  } else {
+    try {
+      await startHookEndpoint((r) => {
+        const extra = [
+          r.sessionId ? `session=${r.sessionId}` : "",
+          r.toolName ? `tool=${r.toolName}` : "",
+          r.transcriptPath ? "hasPath" : "",
+        ].filter(Boolean).join(" ");
+        const pane = r.paneId || `pid:${r.pid ?? "?"}`;
+        console.log(`  [hook] ${r.mux}/${pane} ${r.agent} ${r.event} seq=${r.seq}${extra ? " " + extra : ""}`);
+        if (selfHook && r.paneId) {
+          // Env-primary routing: r.paneId == the mux paneId. (pid fallback for env-less
+          // reports + reconciliation land in Stage 3b.)
+          getBridge(r.paneId)?.onHookReport(r);
+        }
+      });
+      console.log(
+        `  Hooks    : ${hookSocketPath()} (${selfHook ? "SELF_HOOK on — driving bridges" : "log-only; SELF_HOOK=1 to drive"})`,
+      );
+      // SELF_HOOK drives bridges only if our hook is actually installed — else no reports
+      // arrive and the pane silently never cuts over. Warn so it isn't a silent no-op.
+      // `inst.codex` = our hook.json entry + the feature on; Codex ALSO needs a `/hooks` trust
+      // we can't verify here, so we never claim Codex "will report" — only flag it isn't set up
+      // and, when it is, remind about the unverifiable trust step.
+      if (selfHook) {
+        const inst = hooksInstalled();
+        if (!inst.claude && !inst.codex) {
+          console.log("  ⚠ SELF_HOOK=1 but no even-better hooks are installed — no reports will arrive.");
+          console.log("    Run `pnpm start hook-install`, then restart the agent panes.");
+        } else {
+          // Warn per agent that isn't set up (a codex-only pane must not be silently missed).
+          if (!inst.claude) console.log("  ⚠ SELF_HOOK=1 — Claude hooks not installed; run hook-install.");
+          if (!inst.codex)
+            console.log("  ⚠ SELF_HOOK=1 — Codex hooks not active (need hooks.json + `[features] hooks=true`); run hook-install / enable the feature.");
+          else console.log("    Codex: hooks installed — they report only once trusted via `/hooks` (not verifiable here).");
+        }
       }
-    });
-    console.log(
-      `  Hooks    : ${hookSocketPath()} (${selfHook ? "SELF_HOOK on — driving bridges" : "log-only; SELF_HOOK=1 to drive"})`,
-    );
-    // SELF_HOOK drives bridges only if our hook is actually installed — else no reports
-    // arrive and the pane silently never cuts over. Warn so it isn't a silent no-op.
-    // `inst.codex` = our hook.json entry + the feature on; Codex ALSO needs a `/hooks` trust
-    // we can't verify here, so we never claim Codex "will report" — only flag it isn't set up
-    // and, when it is, remind about the unverifiable trust step.
-    if (selfHook) {
-      const inst = hooksInstalled();
-      if (!inst.claude && !inst.codex) {
-        console.log("  ⚠ SELF_HOOK=1 but no even-better hooks are installed — no reports will arrive.");
-        console.log("    Run `pnpm start hook-install`, then restart the agent panes.");
-      } else {
-        // Warn per agent that isn't set up (a codex-only pane must not be silently missed).
-        if (!inst.claude) console.log("  ⚠ SELF_HOOK=1 — Claude hooks not installed; run hook-install.");
-        if (!inst.codex)
-          console.log("  ⚠ SELF_HOOK=1 — Codex hooks not active (need hooks.json + `[features] hooks=true`); run hook-install / enable the feature.");
-        else console.log("    Codex: hooks installed — they report only once trusted via `/hooks` (not verifiable here).");
-      }
+    } catch (err) {
+      console.error(`  Hooks    : disabled — ${(err as Error).message}`);
     }
-  } catch (err) {
-    console.error(`  Hooks    : disabled — ${(err as Error).message}`);
   }
 
   if (publicBase) {
@@ -599,11 +623,11 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
   printConnect("Scan to connect", urlFor(host, actualPort), qrEnabled);
 });
 
-// Tear down both the bridges and the multiplexer (cmux holds a long-lived
-// event-stream child that would otherwise outlive the process).
-function teardown(): void {
-  disposeAll();
-  getMux().dispose?.();
+// The selected catalog owns its live sessions and any child processes.
+let teardownPromise: Promise<void> | undefined;
+function teardown(): Promise<void> {
+  teardownPromise ??= Promise.resolve(catalog.dispose());
+  return teardownPromise;
 }
 
 server.on("error", (err: NodeJS.ErrnoException) => {
@@ -612,21 +636,25 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   } else {
     console.error(`[bridge] server error: ${err.message}`);
   }
-  teardown();
-  process.exit(1);
+  void teardown().finally(() => process.exit(1));
 });
 
-function shutdown(): void {
-  teardown();
-  process.exit(0);
+let shuttingDown = false;
+function shutdown(code: number): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  server.close();
+  void teardown().finally(() => process.exit(code));
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
 process.on("uncaughtException", (err) => {
   console.error(`[bridge] uncaught: ${err.message}\n${err.stack}`);
+  if (sourceMode === "grok") shutdown(1);
 });
 process.on("unhandledRejection", (reason) => {
   console.error(`[bridge] unhandled rejection: ${String(reason)}`);
+  if (sourceMode === "grok") shutdown(1);
 });
 
 // Re-export for potential programmatic use / tests.

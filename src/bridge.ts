@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   getMux,
   typeAndSubmit,
@@ -24,6 +25,7 @@ import {
   type ClassifiedMenu,
   type ParsedMenu,
 } from "./parse.js";
+import type { LiveSession, ProviderId, SessionDescriptor } from "./session.js";
 
 // Human-readable stream tracing on the server console (LOG=trace): dim = new
 // screen content captured by the diff, green = what is actually sent to the
@@ -178,7 +180,7 @@ function toAppState(s: PaneStatus): AppState {
  * messages, turns blocked screens into permission_request/user_question, and
  * injects prompts/decisions back through the Multiplexer.
  */
-export class PaneBridge {
+export class PaneBridge implements LiveSession {
   readonly paneId: string;
   agent: string;
   cwd: string;
@@ -257,8 +259,24 @@ export class PaneBridge {
     this.state = toAppState(info.status);
   }
 
-  get provider(): string {
+  get id(): string {
+    return this.paneId;
+  }
+
+  get provider(): ProviderId {
     return this.agent === "codex" ? "codex" : "claude";
+  }
+
+  async describe(): Promise<SessionDescriptor> {
+    return {
+      id: this.paneId,
+      title: `${this.agent} · ${path.basename(this.cwd || "/")}`,
+      timestamp: new Date().toISOString(),
+      cwd: this.cwd,
+      provider: this.provider,
+      status: this.state,
+      model: "Unknown",
+    };
   }
 
   start(): void {

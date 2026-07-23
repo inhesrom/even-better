@@ -25,6 +25,28 @@ field is derived from the herdr agent name (`codex` -> `codex`, everything else
 spawn or switch the real underlying agent; the bridge mirrors whichever herdr
 pane it targets.
 
+With `SOURCE=grok`, the banner instead reports `Source : grok (ACP stdio)` and
+one `grok:<uuid>` session. There is no pane or transcript path: ACP stdout is the
+structured source.
+
+## Grok startup and session failures
+
+Grok mode starts the owned agent before listening or printing a QR. If startup
+fails, work from the single error line:
+
+1. `Grok 0.2.103 or newer is required` — run `grok --version` and upgrade.
+2. `authentication is unavailable` — set `XAI_API_KEY` or run `grok login` in
+   the same user environment that launches even-better.
+3. `GROK_CWD ...` — use an existing readable/searchable directory.
+4. `timed out` — confirm `grok agent stdio` can start, then increase
+   `GROK_STARTUP_TIMEOUT_MS` only if startup is legitimately slow.
+
+During a live session, an unexpected exit or malformed/lost ACP connection
+emits one failed `result` if a turn is active and marks the session unavailable.
+Restart even-better; v1 does not silently create a replacement session. A
+permission or question remains pending until the glasses answer, interruption,
+or shutdown—there is no automatic allow/deny timeout.
+
 ## Transcript vs ScreenTimeline
 
 The bridge always prefers a structured transcript:
@@ -193,3 +215,13 @@ curl -sS \
 
 Inspect `/tmp/even-better-events.log` or `/tmp/even-better-sim.jsonl` for
 `user_prompt`, streamed text/tool events, `result`, and final idle status.
+
+For Grok, omit the pane simulator and launch the owned source directly:
+
+```bash
+SOURCE=grok GROK_CWD="$PWD" PORT=3457 BRIDGE_TOKEN=test-token QR=0 pnpm start
+curl -sS -H 'Authorization: Bearer test-token' http://127.0.0.1:3457/api/sessions
+```
+
+Use the returned `grok:` session ID in the same prompt command above. A prompt
+that explicitly requests no tools is the cheapest real-agent smoke check.

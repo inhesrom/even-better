@@ -4,11 +4,11 @@
 > standard — read by Codex, Cursor, Zed, etc.). `CLAUDE.md` is a symlink to it for
 > Claude Code. Edit here only; never create a separate per-tool copy.
 
-Mirror a terminal coding-agent session onto Even Realities G2 glasses. A local
-HTTP/SSE server speaks the `@evenrealities/even-terminal` protocol so the stock
-Even app connects by QR scan, but instead of spawning a new agent via the SDK it
-**mirrors an agent already running inside a terminal multiplexer** (herdr today).
-The terminal session and the glasses are the same process.
+Use a coding-agent session from Even Realities G2 glasses. A local HTTP/SSE
+server speaks the `@evenrealities/even-terminal` protocol so the stock Even app
+connects by QR scan. The default `SOURCE=mux` mirrors Claude/Codex already
+running in herdr or cmux. Explicit `SOURCE=grok` instead owns one fresh
+`grok agent stdio` ACP session in `GROK_CWD`.
 
 ## Architecture
 
@@ -43,6 +43,11 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   tick (smooth typing) and interleaves whole events (tool_start) in order.
 - **`bridge.ts`** — `PaneBridge`: the core. Turn lifecycle, token accounting,
   the permission/question interaction state machine.
+- **`session.ts` / `*-session-catalog.ts`** — source-neutral route boundary.
+  Mux delegates to `PaneBridge`; Grok exposes exactly one live session.
+- **`grok-acp-process.ts` / `grok-acp-normalize.ts` / `grok-bridge.ts`** — owned
+  Grok child + ACP SDK, exhaustive wire normalization, and even-terminal event
+  mapping. Keep ACP/private IDs on this producer side.
 - **`expose.ts`** — public tunnel used by the tunnel `ACCESS` modes (`tailscale-funnel`/`funnel`|`pinggy`|`bore`|`ngrok`|`cloudflared`): spawns the tunnel CLI, scrapes its URL, prints the one QR. `funnel` (Tailscale) is SSE-verified + auto-tears-down on exit; Cloudflare *quick* tunnels break SSE — noted inline. `index.ts`'s `resolveAccess()` picks the provider and calls `startExpose(name, …)`.
 - **`sse.ts` / `index.ts`** — even-terminal SSE fan-out + HTTP server.
 - **`parse.ts`** — screen menu parsing (`parseMenu`/`classifyMenu`).
@@ -57,6 +62,9 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   `test-widgets`, `test-menu`, etc.) — pure-function unit tests.
 - End-to-end: `tools/app-sim.ts` records what a connected app receives;
   `tools/analyze-sim.py` scores a recording. See "Verification" below.
+- `pnpm test:app-grok` — deterministic full-server Grok protocol test.
+- `GROK_SMOKE=1 pnpm smoke:grok` — gated one-prompt real-Grok smoke; never run
+  in ordinary tests or without accepting model usage.
 
 ## Critical invariants (each cost a debugging round — do not relearn them)
 
@@ -94,6 +102,10 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   Widgets (status/stats/task_progress) bypass the queue.
 - **Interaction timeouts do not auto-deny.** A blocked pane stays `awaiting`
   until the user answers or the menu clears — no SDK forces a decision on us.
+- **Grok is default-off and process-owned.** Never inspect Grok/auth in mux mode,
+  never fall back between sources, never expose ACP IDs/frames, and never signal
+  a process other than the validated child/group created by `GrokAcpProcess`.
+  Shutdown remains cancel → optional advertised close → EOF → TERM → KILL.
 - **Idle is debounced (`IDLE_GRACE_MS`).** herdr flips to idle transiently
   between tool calls (its prompt box flashes), so committing immediately blanks
   the thinking indicator and fires a spurious `result` mid-turn. Only commit
@@ -136,6 +148,10 @@ app receives. Drive it end-to-end:
    turn via `POST /api/prompt`, then inspect the recording (or `LOG_FILE`) to
    confirm the exact events the app got.
 4. Clean up the scratch workspace (`workspace.close`) afterward.
+
+For Grok changes, also run `pnpm test:app-grok`. The real pre-release gate is
+`GROK_SMOKE=1 pnpm smoke:grok`; it creates and removes its own empty cwd and
+makes exactly one no-tool model request.
 
 `LOG_FILE` records every in/out/diag line — the first place to look when the
 glasses show something wrong. `LOG=trace` traces capture/send/drop per line.

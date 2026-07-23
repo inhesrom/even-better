@@ -1,7 +1,7 @@
 {
   "name": "even-better",
   "version": "0.1.0",
-  "description": "Mirror terminal coding-agent sessions to Even Realities G2 glasses (even-terminal protocol compatible)",
+  "description": "Use mirrored Claude/Codex or an owned Grok ACP session from Even Realities G2 glasses",
   "type": "module",
   "private": true,
   "packageManager": "pnpm@10.12.4",
@@ -17,6 +17,8 @@
     "ar-glasses",
     "claude-code",
     "codex",
+    "grok",
+    "agent-client-protocol",
     "coding-agent",
     "terminal",
     "sse",
@@ -27,15 +29,19 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "check": "tsc --noEmit",
-    "test": "tsx --test scripts/test-*.ts"
+    "test": "tsx --test scripts/test-*.ts",
+    "test:app-grok": "tsx --test scripts/test-grok-server.ts",
+    "smoke:grok": "tsx tools/smoke-grok-acp.ts"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "1.3.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

@@ -14,8 +14,13 @@ like a shell.
 - Public tunnel modes (`PUBLIC_ACCESS=…`) put the endpoint on the internet behind
   only the token — prefer a named tunnel with its own auth (e.g. Cloudflare
   Access) for anything long-lived.
-- Prompts from the glasses are typed into your live agent pane, so the usual
-  prompt-injection considerations for coding agents apply.
+- Prompts from the glasses drive either your live agent pane or an owned Grok
+  ACP child, so the usual prompt-injection considerations for coding agents
+  apply.
+- In `SOURCE=grok`, the child inherits the launch environment (including
+  `XAI_API_KEY`) and working-directory access. `BRIDGE_TOKEN` is removed from
+  that child environment, and raw ACP frames are not written to the event log.
+  Keep the selected `GROK_CWD` as narrow as practical.
 
 ## Reporting a vulnerability
 

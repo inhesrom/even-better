@@ -11,6 +11,7 @@ pnpm install
 pnpm start        # run the server (prints a QR code)
 pnpm check        # tsc --noEmit — must pass before every commit
 pnpm test         # run the unit suites in scripts/
+pnpm test:app-grok # deterministic fake-Grok server/app protocol coverage
 ```
 
 Both `pnpm check` and `pnpm test` run in CI on every pull request.
@@ -29,10 +30,14 @@ Both `pnpm check` and `pnpm test` run in CI on every pull request.
 - The other `docs/` references cover the external contracts — multiplexer
   sockets, session transcripts, the even-terminal protocol, and the permission
   flow.
+- `docs/GROK.md` covers the opt-in ACP process/session contract and its gated
+  real-agent smoke test.
 - `AGENTS.md` — instructions for AI coding agents working in this repo
   (`CLAUDE.md` is a symlink to it). Not required reading for humans.
 
 ## Commits & PRs
 
 Conventional commits (`feat:` / `fix:` / `refactor:` / `docs:` / `chore:`).
-Keep a PR to one topic; make sure `pnpm check` and `pnpm test` pass first.
+Keep a PR to one topic; make sure `pnpm check` and `pnpm test` pass first. Grok
+releases additionally require `pnpm test:app-grok` and the explicitly enabled
+`GROK_SMOKE=1 pnpm smoke:grok` maintainer gate.

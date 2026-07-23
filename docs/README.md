@@ -4,6 +4,8 @@
 
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — runbooks for when the glasses
   show something wrong.
+- **[GROK.md](GROK.md)** — launch, lifecycle, security, limits, and verification
+  for the opt-in Grok ACP source.
 
 **Working on even-better?** These are the contributor references:
 

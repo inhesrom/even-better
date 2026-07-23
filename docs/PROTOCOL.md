@@ -63,16 +63,16 @@ All under `/api`, bearer-token auth (`?token=` or `Authorization: Bearer`).
 | method | path | purpose |
 |--------|------|---------|
 | GET | `/events` | subscribe to the SSE stream (`?sessionId=`) |
-| GET | `/sessions` | list agent panes |
+| GET | `/sessions` | list mirrored panes or the one owned Grok session |
 | GET | `/info` | model / provider / version |
-| GET | `/status` | one pane's state |
+| GET | `/status` | one live session's state |
 | GET | `/messages` | ring-buffer replay (`?after=`) |
 | GET | `/update-check` | version check (static) |
 | GET | `/sessions/:id/history` | history (currently empty) |
 | POST | `/prompt` | inject a user turn (`{ text, sessionId }`) |
 | POST | `/permission-response` | answer a `permission_request` (`{ sessionId, decision }`) |
 | POST | `/question-response` | answer a `user_question` (`{ sessionId, answer }`) |
-| POST | `/interrupt` | send Escape to the pane (`{ sessionId }`) |
+| POST | `/interrupt` | interrupt the session (`{ sessionId }`): Escape for mux, ACP cancellation for Grok |
 
 ## Transport & resilience
 
