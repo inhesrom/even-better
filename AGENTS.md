@@ -6,9 +6,11 @@
 
 Use a coding-agent session from Even Realities G2 glasses. A local HTTP/SSE
 server speaks the `@evenrealities/even-terminal` protocol so the stock Even app
-connects by QR scan. The default `SOURCE=mux` mirrors Claude/Codex already
-running in herdr or cmux. Explicit `SOURCE=grok` instead owns one fresh
-`grok agent stdio` ACP session in `GROK_CWD`.
+connects by QR scan. The installed CLI defaults to `SOURCE=owned`: setup-first,
+persistent phone sessions that choose Claude, Codex, or Grok plus an eligible
+directory. Explicit `SOURCE=mux` mirrors Claude/Codex already running in herdr
+or cmux. Explicit `SOURCE=grok` owns one fresh `grok agent stdio` ACP session in
+`GROK_CWD`.
 
 ## Architecture
 
@@ -44,7 +46,16 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - **`bridge.ts`** — `PaneBridge`: the core. Turn lifecycle, token accounting,
   the permission/question interaction state machine.
 - **`session.ts` / `*-session-catalog.ts`** — source-neutral route boundary.
-  Mux delegates to `PaneBridge`; Grok exposes exactly one live session.
+  Mux delegates to `PaneBridge`; Grok exposes exactly one live session; owned
+  mode lists durable, lazily attached sessions only. The stock **＋ New
+  Session** row is the sole launcher; its null-session first prompt creates a
+  transient setup session, survives the wizard, and runs after provider startup.
+- **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
+  and common owned bridge. Provider adapters own only their native protocol;
+  the common bridge owns public IDs, pacing, interactions, and wire events.
+- **`owned-workspaces.ts` / `owned-config.ts` / `owned-session-store.ts`** —
+  realpath-enforced directory policy, MRU choices, atomic private persistence,
+  leases, executable discovery, limits, and child configuration.
 - **`grok-acp-process.ts` / `grok-acp-normalize.ts` / `grok-bridge.ts`** — owned
   Grok child + ACP SDK, exhaustive wire normalization, and even-terminal event
   mapping. Keep ACP/private IDs on this producer side.
@@ -63,8 +74,11 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - End-to-end: `tools/app-sim.ts` records what a connected app receives;
   `tools/analyze-sim.py` scores a recording. See "Verification" below.
 - `pnpm test:app-grok` — deterministic full-server Grok protocol test.
+- `pnpm test:app-owned` — deterministic full-server owned-session wizard test.
 - `GROK_SMOKE=1 pnpm smoke:grok` — gated one-prompt real-Grok smoke; never run
   in ordinary tests or without accepting model usage.
+- `CLAUDE_SMOKE=1 pnpm smoke:claude` / `CODEX_SMOKE=1 pnpm smoke:codex` — gated
+  one-prompt real owned-agent smokes; never run without accepting model usage.
 
 ## Critical invariants (each cost a debugging round — do not relearn them)
 
@@ -106,6 +120,10 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   never fall back between sources, never expose ACP IDs/frames, and never signal
   a process other than the validated child/group created by `GrokAcpProcess`.
   Shutdown remains cancel → optional advertised close → EOF → TERM → KILL.
+- **Owned workspace selection is a security boundary.** Canonicalize configured
+  roots and requested paths with real paths; reject nonexistent/inaccessible
+  directories, ambiguous relative paths, and symlink escapes. Never create a
+  requested directory or trust the phone's `provider`/`cwd` fields.
 - **Idle is debounced (`IDLE_GRACE_MS`).** herdr flips to idle transiently
   between tool calls (its prompt box flashes), so committing immediately blanks
   the thinking indicator and fires a spurious `result` mid-turn. Only commit

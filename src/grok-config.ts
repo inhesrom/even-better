@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type SourceMode = "mux" | "grok";
+export type SourceMode = "mux" | "grok" | "owned";
 
 export interface GrokConfig {
   bin: string;
@@ -23,7 +23,8 @@ export function resolveSource(env: NodeJS.ProcessEnv): SourceMode {
   const raw = env.SOURCE;
   if (raw === undefined || raw === "" || raw === "mux") return "mux";
   if (raw === "grok") return "grok";
-  throw new GrokConfigError(`invalid SOURCE "${raw}". Use mux or grok.`);
+  if (raw === "owned") return "owned";
+  throw new GrokConfigError(`invalid SOURCE "${raw}". Use mux, grok, or owned.`);
 }
 
 function integerSetting(

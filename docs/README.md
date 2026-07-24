@@ -6,6 +6,9 @@
   show something wrong.
 - **[GROK.md](GROK.md)** — launch, lifecycle, security, limits, and verification
   for the opt-in Grok ACP source.
+- **[OWNED.md](OWNED.md)** — stock-launcher prompt-triggered setup, workspace
+  policy, persistence, resume, provider identity, and session-management
+  commands for the default source.
 
 **Working on even-better?** These are the contributor references:
 

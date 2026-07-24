@@ -6,7 +6,7 @@ if (process.argv.includes("--version")) {
 }
 
 const scenario = process.env.FAKE_GROK_SCENARIO ?? "happy";
-const sessionId = "fake-session";
+let sessionId = "fake-session";
 let nextId = 1000;
 let turn = 0;
 let cancelled = false;
@@ -188,7 +188,9 @@ async function handleRequest(message) {
       : [{ id: "cached_token", name: "Cached login" }];
     respond(id, {
       protocolVersion: scenario === "protocol-v2" ? 2 : 1,
-      agentCapabilities: { sessionCapabilities: {} },
+      agentCapabilities: process.env.FAKE_GROK_RESUME_MODE === "resume"
+        ? { loadSession: false, sessionCapabilities: { resume: {} } }
+        : { loadSession: true, sessionCapabilities: { resume: {} } },
       authMethods,
       agentInfo: { name: "fake-grok", version: "0.2.103" },
       _meta: { models: { currentModelId: "fake-grok-model" } },
@@ -202,6 +204,15 @@ async function handleRequest(message) {
   }
   if (method === "session/new") {
     respond(id, { sessionId, _meta: { models: { currentModelId: "fake-grok-model" } } });
+    return;
+  }
+  if (method === "session/load" || method === "session/resume") {
+    sessionId = params?.sessionId ?? sessionId;
+    update({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "historical native replay" },
+    });
+    respond(id, { _meta: { models: { currentModelId: "fake-grok-model" } } });
     return;
   }
   if (method === "session/prompt") {

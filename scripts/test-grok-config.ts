@@ -14,6 +14,7 @@ test("mux remains the default source", () => {
   assert.equal(resolveSource({}), "mux");
   assert.equal(resolveSource({ SOURCE: "mux" }), "mux");
   assert.equal(resolveSource({ SOURCE: "grok" }), "grok");
+  assert.equal(resolveSource({ SOURCE: "owned" }), "owned");
   assert.throws(() => resolveSource({ SOURCE: "GROK" }), /invalid SOURCE/);
 });
 

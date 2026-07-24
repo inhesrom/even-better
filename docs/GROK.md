@@ -1,7 +1,7 @@
 # Grok ACP source
 
-The Grok source is an explicit alternative to the default Claude/Codex
-multiplexer mirror. It launches one owned Grok CLI child, creates one fresh ACP
+The standalone Grok source is an explicit alternative to default persistent
+owned mode. It launches one Grok CLI child, creates one fresh ACP
 session, and exposes that session through the existing Even-app HTTP/SSE
 protocol.
 
@@ -14,12 +14,12 @@ Requirements:
 - an accessible working directory
 
 ```bash
-pnpm install
-SOURCE=grok GROK_CWD=/absolute/path/to/project pnpm start
+GROK_CWD=/absolute/path/to/project even-better --source grok
 ```
 
-Do not set `MUX` with `SOURCE=grok`. The default remains `SOURCE=mux`, so an
-ordinary `pnpm start` preserves the existing Claude/Codex behavior.
+Do not set `MUX` with `SOURCE=grok`. An ordinary `even-better` launch uses
+persistent owned mode; `even-better --source mux` explicitly preserves the
+existing Claude/Codex mirror behavior.
 
 Startup is fail-closed. even-better checks the CLI version, launches
 `grok --no-auto-update agent stdio`, negotiates ACP v1, chooses headless API-key

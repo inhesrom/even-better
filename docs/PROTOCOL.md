@@ -25,7 +25,7 @@ before emit — see `renderForGlasses`).
 |------|--------|---------|
 | `text_delta` | `text` | assistant prose, streamed a few code points per tick |
 | `user_prompt` | `text` | one user turn (typed from anywhere) |
-| `result` | `success, text, sessionId, costUsd, provider, turns, durationMs, inputTokens, outputTokens` | a turn's closing summary |
+| `result` | `success, text, sessionId, costUsd, provider, agentProvider?, turns, durationMs, inputTokens, outputTokens` | a turn's closing summary |
 | `notification` | `title, message` | an informational message (e.g. "respond in the terminal") |
 
 ### 2. Keyed update — one bubble, running → done (shared `toolId`)
@@ -42,7 +42,7 @@ labels and colours the tool event.
 
 | type | fields | notes |
 |------|--------|-------|
-| `status` | `state: "busy" \| "idle", sessionId` | the thinking indicator |
+| `status` | `state: "busy" \| "idle" \| "awaiting", sessionId, provider?, agentProvider?` | the thinking indicator |
 | `running_stats` | `durationMs, inputTokens, outputTokens` | emitted every 10s during a turn |
 | `task_progress` | `completed, total, current` | from `TodoWrite` / Codex `update_plan` (`todoProgress`/`planProgress`) |
 
@@ -63,13 +63,13 @@ All under `/api`, bearer-token auth (`?token=` or `Authorization: Bearer`).
 | method | path | purpose |
 |--------|------|---------|
 | GET | `/events` | subscribe to the SSE stream (`?sessionId=`) |
-| GET | `/sessions` | list mirrored panes or the one owned Grok session |
+| GET | `/sessions` | list mirrored panes, standalone Grok, or remembered owned sessions; the stock app supplies owned mode's creation row |
 | GET | `/info` | model / provider / version |
 | GET | `/status` | one live session's state |
 | GET | `/messages` | ring-buffer replay (`?after=`) |
 | GET | `/update-check` | version check (static) |
-| GET | `/sessions/:id/history` | history (currently empty) |
-| POST | `/prompt` | inject a user turn (`{ text, sessionId }`) |
+| GET | `/sessions/:id/history` | recent display history as `{ history:[{ role, text }] }` |
+| POST | `/prompt` | inject a user turn (`{ text, sessionId }`); in owned mode a null/missing ID creates a transient setup session and returns `202` with its stable ID, while a second prompt during setup returns `409` |
 | POST | `/permission-response` | answer a `permission_request` (`{ sessionId, decision }`) |
 | POST | `/question-response` | answer a `user_question` (`{ sessionId, answer }`) |
 | POST | `/interrupt` | interrupt the session (`{ sessionId }`): Escape for mux, ACP cancellation for Grok |
@@ -145,10 +145,9 @@ Reconnect behavior, as recorded by the `src/sse.ts` logging:
 **Intentional deviations from 0.8.1 (do not revert):** last-20 replay cap;
 immediate `status` snapshot pushed on connect (else an app connecting while idle
 waits forever for a transition); `retry: 2000` + socket-error logging; timing-safe
-token comparison; always-500 `/prompt` errors; stubbed `/update-check` &
-`/sessions/:id/history`; no `/debug/*` or `/metrics` routes.
+token comparison; static `/update-check`; no `/debug/*` or `/metrics` routes.
 
-## Host limitation: one agent type per connection
+## Provider compatibility and owned-mode exception
 
 even-better reports a **single** `provider` to the app — `/api/info` and the QR
 connection default both derive it from the focused/first agent
@@ -158,6 +157,28 @@ configured for one type, so **only that agent type's sessions surface on the
 glasses**. Two agent types cannot be shown at once; to see the other, make it the
 focused agent so `/info` reports it (i.e. switch the host's type). Prerequisite —
 the agent must also be tracked by the mux (`docs/MULTIPLEXERS.md` §Prerequisites).
+
+`SOURCE=owned` intentionally reports `provider:"codex"` from `/api/info`, every
+session descriptor, `/status`, status events, prompt responses, and results, and
+ignores the phone's `?provider=codex` session filter. Codex is only the static
+app's compatibility handshake. Completed owned rows additionally carry
+`agentProvider:"claude"|"codex"|"grok"`; titles also expose the real provider.
+The catalog lists remembered sessions only. The stock app independently renders
+the sole **＋ New Session** row, which remains voice-first and does not appear in
+`/api/sessions`. Its first `POST /prompt` has a null or missing `sessionId`;
+owned mode creates a transient session, retains the prompt, and returns `202`
+with a stable public ID. That ID's `/events` stream emits the agent question;
+the directory question follows the answer. During setup the descriptor title is
+**Setting up agent session…**, it has no `agentProvider`, and an additional
+prompt returns `409`.
+
+After provider startup, owned mode persists the native resume ID and first
+prompt, appends the prompt to display history, converts that same public ID into
+a remembered session, and emits its `user_prompt` exactly once through the
+owned bridge. Startup failure keeps the transient session and retained prompt
+and reopens setup. The phone's creation and follow-up `provider` and `cwd`
+fields are ignored; the glasses wizard is authoritative and cannot retarget an
+existing remembered session.
 
 ## Not wire types
 

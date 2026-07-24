@@ -25,6 +25,8 @@ import { maskToken, printConnect } from "./connect-url.js";
 import { resolveGrokConfig, resolveSource, type SourceMode } from "./grok-config.js";
 import { GrokSessionCatalog } from "./grok-session-catalog.js";
 import { MuxSessionCatalog } from "./mux-session-catalog.js";
+import { resolveOwnedConfig } from "./owned-config.js";
+import { OwnedSessionCatalog } from "./owned-session-catalog.js";
 import { SessionControlError, type ProviderId, type SessionCatalog } from "./session.js";
 
 // Tee the terminal diagnostics to a file before anything logs, so the lines needed to
@@ -145,7 +147,7 @@ function resolveToken(): string {
   return randomBytes(24).toString("hex");
 }
 const TOKEN = resolveToken();
-let defaultProvider: ProviderId = sourceMode === "grok" ? "grok" : "claude";
+let defaultProvider: ProviderId = sourceMode === "grok" ? "grok" : sourceMode === "owned" ? "codex" : "claude";
 
 function controlError(res: Response, err: unknown): void {
   const status = err instanceof SessionControlError ? err.status : 500;
@@ -268,8 +270,18 @@ api.get("/events", (req, res) => {
   if (sessionId) {
     void catalog
       .get(sessionId)
-      .then((session) => {
-        if (session) emit(sessionId, { type: "status", state: session.state, sessionId });
+      .then(async (session) => {
+        if (session) {
+          await session.onConnect?.();
+          session.replayPending?.();
+          emit(sessionId, {
+            type: "status",
+            state: session.state,
+            sessionId,
+            provider: session.provider,
+            ...(session.agentProvider ? { agentProvider: session.agentProvider } : {}),
+          });
+        }
       })
       .catch(() => undefined);
   }
@@ -283,6 +295,7 @@ api.get("/sessions", async (_req, res) => {
       timestamp: session.timestamp,
       cwd: session.cwd,
       provider: session.provider,
+      ...(session.agentProvider ? { agentProvider: session.agentProvider } : {}),
       status: session.status,
     }));
     res.json({ sessions });
@@ -321,7 +334,7 @@ api.get("/update-check", (_req, res) => {
 api.post("/prompt", async (req, res) => {
   const { text, sessionId } = (req.body ?? {}) as {
     text?: string;
-    sessionId?: string;
+    sessionId?: string | null;
   };
   if (!text || typeof text !== "string") {
     res.status(400).json({ error: "Missing 'text' field" });
@@ -335,7 +348,12 @@ api.post("/prompt", async (req, res) => {
     }
     console.log(`[prompt] session=${session.id} text=${text.slice(0, 80)}`);
     await session.prompt(text);
-    res.status(202).json({ ok: true, sessionId: session.id, provider: session.provider });
+    res.status(202).json({
+      ok: true,
+      sessionId: session.id,
+      provider: session.provider,
+      ...(session.agentProvider ? { agentProvider: session.agentProvider } : {}),
+    });
   } catch (err) {
     controlError(res, err);
   }
@@ -416,7 +434,12 @@ api.get("/status", async (req, res) => {
       res.status(404).json({ error: "Session not found" });
       return;
     }
-    res.json({ state: session.state, sessionId, provider: session.provider });
+    res.json({
+      state: session.state,
+      sessionId,
+      provider: session.provider,
+      ...(session.agentProvider ? { agentProvider: session.agentProvider } : {}),
+    });
   } catch (err) {
     controlError(res, err);
   }
@@ -436,14 +459,24 @@ api.get("/messages", async (req, res) => {
       state: session?.state ?? "idle",
       sessionId,
       provider: session?.provider ?? null,
+      ...(session?.agentProvider ? { agentProvider: session.agentProvider } : {}),
     });
   } catch (err) {
     controlError(res, err);
   }
 });
 
-api.get("/sessions/:id/history", (_req, res) => {
-  res.json({ history: [] });
+api.get("/sessions/:id/history", async (req, res) => {
+  try {
+    const session = await catalog.get(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    res.json({ history: await session.history?.() ?? [] });
+  } catch (err) {
+    controlError(res, err);
+  }
 });
 
 // ── startup ────────────────────────────────────────────
@@ -513,8 +546,10 @@ try {
   if (sourceMode === "mux") {
     setMux(await selectMux());
     catalog = new MuxSessionCatalog();
-  } else {
+  } else if (sourceMode === "grok") {
     catalog = await GrokSessionCatalog.start(resolveGrokConfig(process.env));
+  } else {
+    catalog = new OwnedSessionCatalog(resolveOwnedConfig(process.env));
   }
 } catch (err) {
   console.error(`error: ${(err as Error).message}`);
@@ -527,7 +562,7 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
   console.log("");
   console.log(`  even-better v${VERSION}`);
   console.log(`  Instance : ${INSTANCE_ID}`);
-  console.log(`  Source   : ${sourceMode === "mux" ? `mux (${getMux().name})` : "grok (ACP stdio)"}`);
+  console.log(`  Source   : ${sourceMode === "mux" ? `mux (${getMux().name})` : sourceMode === "grok" ? "grok (ACP stdio)" : "owned (per-session agent)"}`);
   console.log(`  Bind     : ${bind.label}`);
   console.log(`  Local    : http://${bind.bindHost === "0.0.0.0" ? "127.0.0.1" : bind.bindHost}:${actualPort}`);
   if (basePaths.length > 0) console.log(`  Paths    : ${basePaths.join(", ")}`);
@@ -549,7 +584,7 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
       console.log(`  agent : none yet — start claude or codex inside ${getMux().name}; it's picked up automatically (no restart).`);
     }
   } catch (err) {
-    const source = sourceMode === "mux" ? getMux().name : "grok ACP";
+    const source = sourceMode === "mux" ? getMux().name : sourceMode === "grok" ? "grok ACP" : "owned agents";
     console.error(`  ${source} : NOT REACHABLE — ${(err as Error).message}`);
   }
 
@@ -557,8 +592,8 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
   // bridge's status/session via the per-pane cutover; off by default (log-only).
   // Install with `pnpm start hook-install`; remove with `hook-uninstall`.
   const selfHook = process.env.SELF_HOOK === "1";
-  if (sourceMode === "grok") {
-    console.log("  Hooks    : not used by the Grok ACP source");
+  if (sourceMode !== "mux") {
+    console.log(`  Hooks    : not used by the ${sourceMode} source`);
   } else {
     try {
       await startHookEndpoint((r) => {
@@ -650,11 +685,11 @@ process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 process.on("uncaughtException", (err) => {
   console.error(`[bridge] uncaught: ${err.message}\n${err.stack}`);
-  if (sourceMode === "grok") shutdown(1);
+  if (sourceMode !== "mux") shutdown(1);
 });
 process.on("unhandledRejection", (reason) => {
   console.error(`[bridge] unhandled rejection: ${String(reason)}`);
-  if (sourceMode === "grok") shutdown(1);
+  if (sourceMode !== "mux") shutdown(1);
 });
 
 // Re-export for potential programmatic use / tests.

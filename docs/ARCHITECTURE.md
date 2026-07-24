@@ -8,7 +8,7 @@ about" at the end.
 ## What this system actually is
 
 One sentence: **it turns a live coding-agent session—either mirrored from a
-terminal or owned over ACP—into a provider-neutral event stream, and renders
+terminal or owned through a provider adapter—into a provider-neutral event stream, and renders
 that stream onto a tiny remote display while relaying input back.**
 
 That sentence names the real center of the design — the *event stream*.
@@ -28,15 +28,15 @@ seams belong only where a second real implementation is coming.
 
 ## Implemented runtime source boundary
 
-`SOURCE=mux` (the default) and `SOURCE=grok` are selected once at launch. HTTP
+`SOURCE=owned` (the CLI default), `SOURCE=mux`, and `SOURCE=grok` are selected once at launch. HTTP
 routes depend on the small `SessionCatalog` / `LiveSession` boundary in
 `src/session.ts`, rather than knowing how a session is produced.
 
 ```text
                        SessionCatalog / LiveSession
                       ┌─────────────────────────────┐
-MuxSessionCatalog ───►│ list, get, prompt, respond, │◄─── GrokSessionCatalog
-  └─ PaneBridge       │ interrupt, state, dispose   │       └─ GrokSessionBridge
+MuxSessionCatalog ───►│ list, get, default, prompt, │◄─── GrokSessionCatalog
+  └─ PaneBridge       │ respond, interrupt, dispose │       └─ GrokSessionBridge
                       └──────────────┬──────────────┘          └─ GrokAcpProcess
                                      │
                               HTTP/SSE protocol
@@ -47,6 +47,37 @@ design below. It lets the ACP implementation coexist with `PaneBridge` without
 refactoring the mature Claude/Codex transcript and multiplexer paths. The mux
 adapter delegates to the existing bridge manager; the Grok adapter owns exactly
 one child and one session.
+
+Owned mode adds a third catalog without changing either existing path:
+
+```text
+OwnedSessionCatalog
+  ├─ default() creates a transient setup session from the first prompt
+  └─ remembered sessions (metadata + display history; lazily attached)
+       └─ OwnedSessionBridge (wire events, pacing, interaction state)
+            └─ OwnedAgent
+                 ├─ ClaudeOwnedAgent (Claude Agent SDK resume)
+                 ├─ CodexOwnedAgent  (app-server thread/resume)
+                 └─ GrokOwnedAgent   (ACP session/load or session/resume)
+```
+
+The stock app's voice-first **＋ New Session** row is outside the catalog and is
+the sole creation row. Its null-session first prompt makes `default()` create a
+transient setup session with a stable public ID. The wizard retains that prompt
+while it chooses a provider and directory. Successful setup starts and persists
+the native provider session, transforms the same public ID into a remembered
+session, and forwards the retained prompt through `OwnedSessionBridge` exactly
+once. Additional prompts are rejected while setup is unfinished.
+
+`OwnedAgent` is deliberately source-neutral: adapters only own their native
+process/protocol and emit normalized prose, tool, plan, usage, interaction,
+status, and result events. The common bridge owns phone-facing IDs, output
+pacing, replayable interaction state, and result synthesis. `OwnedSessionCatalog`
+owns prompt-triggered setup, first-prompt retention, the workspace wizard,
+persistent store, attached-process cap, leases, and process lifetime. Each
+remembered session's agent provider and canonical cwd are immutable after setup.
+The phone-facing provider is always Codex in owned mode; `agentProvider` carries
+the real provider identity.
 
 The Grok producer is split into three concrete responsibilities:
 

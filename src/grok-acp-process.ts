@@ -168,6 +168,7 @@ export class GrokAcpProcess {
   private latestXaiTerminal: ReturnType<typeof parseXaiTurnCompleted> = null;
   private xaiWaiters = new Map<string, Set<() => void>>();
   private seenEventIds = new Set<string>();
+  private suppressSessionUpdates = false;
 
   constructor(private readonly config: GrokConfig) {}
 
@@ -188,7 +189,7 @@ export class GrokAcpProcess {
     for (const listener of this.listeners) listener(event);
   }
 
-  async start(): Promise<{ model: string; version: string }> {
+  async start(nativeSessionId?: string): Promise<{ model: string; version: string; sessionId: string }> {
     const deadline = Date.now() + this.config.startupTimeoutMs;
     let versionOutput: string;
     try {
@@ -317,32 +318,72 @@ export class GrokAcpProcess {
         if (/timed out/.test(safeError(error))) throw error;
         throw authError(method);
       }
-      let session: acp.NewSessionResponse;
-      try {
-        session = await this.beforeDeadline(
-          this.context.request(acp.methods.agent.session.new, {
-            cwd: this.config.cwd,
-            mcpServers: [],
-          }),
-          deadline,
-          "session creation",
-        );
-      } catch (error) {
-        if (/timed out/.test(safeError(error))) throw error;
-        throw new Error(
-          "Grok could not create a session in GROK_CWD. Check directory access and Grok configuration.",
-        );
+      let sessionInfo: unknown;
+      if (nativeSessionId) {
+        this.sessionId = nativeSessionId;
+        this.suppressSessionUpdates = true;
+        const params = { sessionId: nativeSessionId, cwd: this.config.cwd, mcpServers: [] };
+        try {
+          if (this.capabilities.loadSession) {
+            try {
+              sessionInfo = await this.beforeDeadline(
+                this.context.request(acp.methods.agent.session.load, params),
+                deadline,
+                "session load",
+              );
+            } catch (error) {
+              if (!this.capabilities.sessionCapabilities?.resume) throw error;
+              sessionInfo = await this.beforeDeadline(
+                this.context.request(acp.methods.agent.session.resume, params),
+                deadline,
+                "session resume",
+              );
+            }
+          } else if (this.capabilities.sessionCapabilities?.resume) {
+            sessionInfo = await this.beforeDeadline(
+              this.context.request(acp.methods.agent.session.resume, params),
+              deadline,
+              "session resume",
+            );
+          } else {
+            throw new Error("Grok does not advertise session/load or session/resume; update Grok before reopening this remembered session.");
+          }
+        } catch (error) {
+          if (/timed out/.test(safeError(error))) throw error;
+          throw new Error(`Grok could not resume session ${nativeSessionId}. ${safeError(error)}`);
+        } finally {
+          await this.inboundTail;
+          this.suppressSessionUpdates = false;
+        }
+      } else {
+        try {
+          const session = await this.beforeDeadline(
+            this.context.request(acp.methods.agent.session.new, {
+              cwd: this.config.cwd,
+              mcpServers: [],
+            }),
+            deadline,
+            "session creation",
+          );
+          this.sessionId = session.sessionId;
+          sessionInfo = session;
+        } catch (error) {
+          if (/timed out/.test(safeError(error))) throw error;
+          throw new Error(
+            "Grok could not create a session in GROK_CWD. Check directory access and Grok configuration.",
+          );
+        }
       }
       await this.inboundTail;
       if (this.closing) throw new Error("Grok ended during session creation.");
-      if (this.provisionalSessionId && this.provisionalSessionId !== session.sessionId) {
+      if (this.provisionalSessionId && this.provisionalSessionId !== this.sessionId) {
         throw new Error("Grok sent ACP data for the wrong session during startup.");
       }
-      this.sessionId = session.sessionId;
       this.available = true;
       return {
         version: version.display,
-        model: modelFrom(session) || modelFrom(initialized) || "Unknown",
+        model: modelFrom(sessionInfo) || modelFrom(initialized) || "Unknown",
+        sessionId: this.sessionId,
       };
     } catch (error) {
       await this.dispose();
@@ -484,6 +525,7 @@ export class GrokAcpProcess {
   }
 
   private handleSessionUpdate(notification: acp.SessionNotification): void {
+    if (this.suppressSessionUpdates && notification.sessionId === this.sessionId) return;
     if (this.promptTerminalSeen || !this.acceptEvent(notification._meta)) return;
     if (!this.sessionId) {
       if (!this.provisionalSessionId) this.provisionalSessionId = notification.sessionId;

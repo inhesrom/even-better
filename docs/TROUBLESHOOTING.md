@@ -29,6 +29,53 @@ With `SOURCE=grok`, the banner instead reports `Source : grok (ACP stdio)` and
 one `grok:<uuid>` session. There is no pane or transcript path: ACP stdout is the
 structured source.
 
+With the default owned source, the banner reports `Source : owned` and the app
+always connects as the Codex compatibility provider. `/api/sessions` returns
+remembered rows only; the stock app contributes the sole voice-first **＋ New
+Session** creation row. A Claude/Grok row still has `provider:"codex"`; inspect
+`agentProvider` or the title for the real agent.
+
+## Owned creation, persistence, and resume failures
+
+Before the first prompt, `GET /api/sessions` should contain remembered sessions
+only. Submitting a voice prompt from the stock **＋ New Session** row should
+return `202` with an `owned:` session ID. That ID appears temporarily as
+**Setting up agent session…**; connecting its SSE stream emits the agent
+question, and answering it emits the directory question.
+
+After directory selection, the same ID should become **Provider · folder ·
+prompt excerpt**. Persisted metadata and display history should contain the
+first prompt, and the event stream should contain one matching `user_prompt`
+followed by the provider turn. A second prompt targeting unfinished setup should
+return `409` so the retained prompt cannot be replaced or duplicated.
+
+If provider startup fails, the notification should be followed by a replayed
+setup question; the original prompt remains pending for the retry. Unfinished
+setup is transient and can be lost on server restart, while completed sessions
+remain durable.
+
+The launch cwd is the default workspace root. Explicit `--workspace-root`
+flags replace it, followed in precedence by `WORKSPACE_ROOTS`. An invalid
+directory message means the candidate does not exist, resolves outside every
+root (including through a symlink), or is ambiguous as a relative path. Enter
+an absolute existing descendant to disambiguate.
+
+Remembered metadata/history lives under the platform state directory or
+`EVEN_BETTER_HOME`. A row that survives restart but emits “could not resume” has
+kept its even-better data; verify the original provider CLI, authentication,
+native transcript, and exact cwd. Claude resumes its SDK session, Codex uses
+`thread/resume`, and Grok requires advertised `session/load` or
+`session/resume` support.
+
+`MAX_OWNED_SESSIONS` counts attached processes. An “all attached sessions are
+busy or awaiting input” error is not a catalog limit: finish, answer, or
+interrupt one protected session and retry. Idle processes are detached by LRU
+without forgetting their rows.
+
+`even-better sessions remove` and `clear` refuse leased rows while a server owns
+them. Stop that server first. These commands never delete native provider
+transcripts.
+
 ## Grok startup and session failures
 
 Grok mode starts the owned agent before listening or printing a QR. If startup

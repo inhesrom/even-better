@@ -17,14 +17,22 @@ export interface SessionDescriptor {
   timestamp: string;
   cwd: string;
   provider: ProviderId;
+  /** Real provider behind a compatibility provider, when they differ. */
+  agentProvider?: ProviderId;
   status: SessionState;
   model: string;
+}
+
+export interface SessionHistoryEntry {
+  role: "user" | "assistant";
+  text: string;
 }
 
 /** One live session behind the existing even-terminal control routes. */
 export interface LiveSession {
   readonly id: string;
   readonly provider: ProviderId;
+  readonly agentProvider?: ProviderId;
   readonly cwd: string;
   readonly state: SessionState;
   describe(): Promise<SessionDescriptor>;
@@ -32,6 +40,12 @@ export interface LiveSession {
   respondPermission(decision: string): Promise<void>;
   respondQuestion(answer: string): Promise<void>;
   interrupt(): Promise<void>;
+  /** Attach a remembered native session when the app opens its SSE stream. */
+  onConnect?(): Promise<void>;
+  /** Recent local display history; native transcripts remain authoritative. */
+  history?(): Promise<SessionHistoryEntry[]>;
+  /** Re-emit the currently blocking interaction after an SSE reconnect. */
+  replayPending?(): void;
   dispose(): void | Promise<void>;
 }
 
