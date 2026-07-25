@@ -120,6 +120,18 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   never fall back between sources, never expose ACP IDs/frames, and never signal
   a process other than the validated child/group created by `GrokAcpProcess`.
   Shutdown remains cancel → optional advertised close → EOF → TERM → KILL.
+- **Owned Claude startup must never wait for `system/init`.** The Agent SDK emits
+  that message only once a turn begins, and the first prompt is not sent until
+  `start()` resolves — waiting on it deadlocks until the startup timeout, every
+  time. `initializationResult()` is the startup signal; it carries no session id
+  or active model, so a fresh session is *named* by us (`sessionId`, a UUID) and
+  the model is late-bound from `system/init` on turn one. Fakes that announce
+  `system/init` eagerly hide this — `test-claude-owned-agent.ts` must not.
+- **One owned interaction is presented at a time.** The SDK dispatches
+  `can_use_tool` for every tool in a batched assistant message concurrently, so
+  a single pending slot silently orphans all but the last; an orphaned request
+  blocks the CLI forever and the turn never reaches `result`. `ClaudeOwnedAgent`
+  queues them and shows only the head.
 - **Owned workspace selection is a security boundary.** Canonicalize configured
   roots and requested paths with real paths; reject nonexistent/inaccessible
   directories, ambiguous relative paths, and symlink escapes. Never create a

@@ -92,7 +92,9 @@ rows also include `agentProvider:"claude"|"codex"|"grok"`, and their titles name
 the real provider.
 
 Claude uses `@anthropic-ai/claude-agent-sdk` and the installed `claude`
-executable. Codex uses the generated app-server schema verified for exact CLI
+executable. A new Claude session is *named* by even-better (the SDK's `sessionId`
+option) rather than discovered, because the SDK reports a session id only once
+the first turn begins — see the startup invariant in `AGENTS.md`. Codex uses the generated app-server schema verified for exact CLI
 versions 0.142.5 and 0.145.0. Grok uses ACP with CLI 0.2.103 or newer. All CLIs
 must already be authenticated; missing executables are omitted from the wizard.
 Agent children do not inherit `BRIDGE_TOKEN`.

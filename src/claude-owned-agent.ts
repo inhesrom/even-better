@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
   query,
+  type CanUseTool,
   type PermissionResult,
   type PermissionUpdate,
   type Query,
@@ -9,7 +11,15 @@ import {
 import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo, OwnedQuestion } from "./owned-agent.js";
 import type { OwnedProviderConfig } from "./owned-config.js";
 
+type CanUseToolOptions = Parameters<CanUseTool>[2];
+
+const STDERR_TAIL_LIMIT = 4_000;
+
 interface PendingPermission {
+  kind: "permission";
+  toolUseId: string;
+  toolName: string;
+  description: string;
   input: Record<string, unknown>;
   suggestions: PermissionUpdate[];
   resolve: (result: PermissionResult) => void;
@@ -23,12 +33,17 @@ interface ClaudeQuestion {
 }
 
 interface PendingQuestion {
+  kind: "question";
+  toolUseId: string;
   input: Record<string, unknown>;
   questions: ClaudeQuestion[];
   index: number;
   answers: Record<string, string | string[]>;
   resolve: (result: PermissionResult) => void;
 }
+
+/** The SDK dispatches can_use_tool concurrently; the glasses answer one prompt at a time. */
+type PendingInteraction = PendingPermission | PendingQuestion;
 
 class MessageQueue implements AsyncIterable<SDKUserMessage> {
   private values: SDKUserMessage[] = [];
@@ -140,11 +155,10 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   private sink: OwnedAgentSink | null = null;
   private queryHandle: Query | null = null;
   private consumePromise: Promise<void> | null = null;
-  private permission: PendingPermission | null = null;
-  private question: PendingQuestion | null = null;
+  private readonly interactions: PendingInteraction[] = [];
+  private stderrTail = "";
   private active = false;
   private disposed = false;
-  private resolveIdentity: ((info: OwnedAgentStartInfo) => void) | null = null;
 
   constructor(
     readonly cwd: string,
@@ -154,9 +168,10 @@ export class ClaudeOwnedAgent implements OwnedAgent {
 
   async start(sink: OwnedAgentSink, nativeSessionId?: string): Promise<OwnedAgentStartInfo> {
     this.sink = sink;
-    const identity = new Promise<OwnedAgentStartInfo>((resolve) => {
-      this.resolveIdentity = resolve;
-    });
+    // The CLI emits system/init only once a turn begins, and the first prompt is not sent
+    // until start() resolves — so startup must never wait for it. Naming the session up
+    // front is what makes the id knowable before the first turn.
+    const sessionId = nativeSessionId ?? randomUUID();
     this.queryHandle = this.queryFactory({
       prompt: this.input,
       options: {
@@ -165,23 +180,27 @@ export class ClaudeOwnedAgent implements OwnedAgent {
         env: this.config.env,
         permissionMode: "default",
         persistSession: true,
-        ...(nativeSessionId ? { resume: nativeSessionId } : {}),
-        canUseTool: (toolName, input, options) => this.canUseTool(toolName, input, options.suggestions ?? [], options.signal),
+        stderr: (data: string) => {
+          this.stderrTail = (this.stderrTail + data).slice(-STDERR_TAIL_LIMIT);
+        },
+        // `sessionId` is rejected alongside `resume` unless the session is forked.
+        ...(nativeSessionId ? { resume: nativeSessionId } : { sessionId }),
+        canUseTool: (toolName, input, options) => this.enqueueInteraction(toolName, input, options),
       },
     });
     this.consumePromise = this.consume();
     try {
-      await timeout(Promise.all([
+      await timeout(
         this.queryHandle.initializationResult(),
-        identity,
-      ]),
         this.config.startupTimeoutMs,
         "Claude startup timed out. Check the Claude executable and authentication.",
       );
-      return await identity;
+      // initializationResult() carries no active model; system/init reports it on turn one.
+      return { nativeSessionId: sessionId, model: "" };
     } catch (error) {
       await this.dispose();
-      throw new Error(`Claude could not start. Run claude once to verify authentication. ${error instanceof Error ? error.message : String(error)}`);
+      const detail = this.stderrTail.trim();
+      throw new Error(`Claude could not start. Run claude once to verify authentication. ${error instanceof Error ? error.message : String(error)}${detail ? ` ${detail}` : ""}`);
     }
   }
 
@@ -198,9 +217,9 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   }
 
   respondPermission(decision: string): Promise<void> {
-    const pending = this.permission;
-    if (!pending) return Promise.reject(new Error("No matching Claude permission."));
-    this.permission = null;
+    const pending = this.interactions[0];
+    if (!pending || pending.kind !== "permission") return Promise.reject(new Error("No matching Claude permission."));
+    this.interactions.shift();
     if (decision === "allow" || decision === "allowAlways") {
       pending.resolve({
         behavior: "allow",
@@ -212,12 +231,13 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     } else {
       pending.resolve({ behavior: "deny", message: "User denied this action." });
     }
+    this.presentHead();
     return Promise.resolve();
   }
 
   respondQuestion(answer: string): Promise<void> {
-    const pending = this.question;
-    if (!pending) return Promise.reject(new Error("No matching Claude question."));
+    const pending = this.interactions[0];
+    if (!pending || pending.kind !== "question") return Promise.reject(new Error("No matching Claude question."));
     const question = pending.questions[pending.index];
     pending.answers[question.question] = normalizeQuestionAnswer(question, answer);
     pending.index++;
@@ -225,16 +245,17 @@ export class ClaudeOwnedAgent implements OwnedAgent {
       this.emitQuestion(pending);
       return Promise.resolve();
     }
-    this.question = null;
+    this.interactions.shift();
     pending.resolve({
       behavior: "allow",
       updatedInput: { ...pending.input, questions: pending.questions, answers: pending.answers },
     });
+    this.presentHead();
     return Promise.resolve();
   }
 
   async interrupt(): Promise<void> {
-    this.rejectInteractions();
+    this.rejectInteractions("Session interrupted.");
     if (!this.queryHandle || !this.active) return;
     await timeout(
       this.queryHandle.interrupt().then(() => undefined),
@@ -246,7 +267,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    this.rejectInteractions();
+    this.rejectInteractions("Session ended.");
     this.input.close();
     this.queryHandle?.close();
     if (this.consumePromise) {
@@ -259,50 +280,73 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     this.queryHandle = null;
   }
 
-  private canUseTool(
+  /**
+   * The SDK fires can_use_tool for every tool in a batched assistant message at once. Only
+   * the queue head is ever shown; the rest stay pending so none is orphaned — an orphaned
+   * request blocks the CLI forever and the turn never reaches `result`.
+   */
+  private enqueueInteraction(
     toolName: string,
     input: Record<string, unknown>,
-    suggestions: PermissionUpdate[],
-    signal: AbortSignal,
+    options: CanUseToolOptions,
   ): Promise<PermissionResult> {
     if (!this.sink) return Promise.resolve({ behavior: "deny", message: "Owned session is unavailable." });
-    if (toolName === "AskUserQuestion") {
-      const questions = parseQuestions(input);
-      if (!questions.length) return Promise.resolve({ behavior: "deny", message: "Claude sent an invalid question." });
-      return new Promise((resolve) => {
-        const pending: PendingQuestion = { input, questions, index: 0, answers: {}, resolve };
-        this.question = pending;
-        signal.addEventListener("abort", () => {
-          if (this.question === pending) {
-            this.question = null;
-            resolve({ behavior: "deny", message: "Question cancelled." });
-          }
-        }, { once: true });
-        this.emitQuestion(pending);
-      });
+    const questions = toolName === "AskUserQuestion" ? parseQuestions(input) : [];
+    if (toolName === "AskUserQuestion" && !questions.length) {
+      return Promise.resolve({ behavior: "deny", message: "Claude sent an invalid question." });
     }
     return new Promise((resolve) => {
-      const pending: PendingPermission = { input, suggestions, resolve };
-      this.permission = pending;
-      signal.addEventListener("abort", () => {
-        if (this.permission === pending) {
-          this.permission = null;
-          resolve({ behavior: "deny", message: "Permission request cancelled." });
-        }
-      }, { once: true });
-      const sessionSuggestion = suggestions.some((suggestion) => "destination" in suggestion && suggestion.destination === "session");
-      this.sink!.event({
-        type: "permission",
-        id: `claude-permission:${Date.now()}`,
-        toolId: `claude-tool:${Date.now()}`,
-        toolName,
-        description: readable(input),
-        options: [
-          { key: "allow", label: "Allow once" },
-          ...(sessionSuggestion ? [{ key: "allowAlways" as const, label: "Allow for session" }] : []),
-          { key: "deny", label: "Deny" },
-        ],
-      });
+      const pending: PendingInteraction = questions.length
+        ? { kind: "question", toolUseId: options.toolUseID, input, questions, index: 0, answers: {}, resolve }
+        : {
+            kind: "permission",
+            toolUseId: options.toolUseID,
+            toolName,
+            description: options.title || options.displayName || readable(input),
+            input,
+            suggestions: options.suggestions ?? [],
+            resolve,
+          };
+      this.interactions.push(pending);
+      options.signal.addEventListener("abort", () => this.cancelInteraction(pending), { once: true });
+      if (this.interactions[0] === pending) this.present(pending);
+    });
+  }
+
+  private cancelInteraction(pending: PendingInteraction): void {
+    const index = this.interactions.indexOf(pending);
+    if (index === -1) return;
+    this.interactions.splice(index, 1);
+    pending.resolve({
+      behavior: "deny",
+      message: pending.kind === "question" ? "Question cancelled." : "Permission request cancelled.",
+    });
+    if (index === 0) this.presentHead();
+  }
+
+  private presentHead(): void {
+    const head = this.interactions[0];
+    if (head) this.present(head);
+  }
+
+  private present(pending: PendingInteraction): void {
+    if (pending.kind === "question") {
+      this.emitQuestion(pending);
+      return;
+    }
+    const sessionSuggestion = pending.suggestions.some((suggestion) => "destination" in suggestion && suggestion.destination === "session");
+    this.sink?.event({
+      type: "permission",
+      id: `claude-permission:${pending.toolUseId}`,
+      // The real tool id, so the bridge attaches this to the tool's existing bubble.
+      toolId: pending.toolUseId,
+      toolName: pending.toolName,
+      description: pending.description,
+      options: [
+        { key: "allow", label: "Allow once" },
+        ...(sessionSuggestion ? [{ key: "allowAlways" as const, label: "Allow for session" }] : []),
+        { key: "deny", label: "Deny" },
+      ],
     });
   }
 
@@ -316,7 +360,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     };
     this.sink?.event({
       type: "question",
-      id: `claude-question:${pending.index}`,
+      id: `claude-question:${pending.toolUseId}:${pending.index}`,
       question,
       index: pending.index,
       total: pending.questions.length,
@@ -337,9 +381,8 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   private onMessage(message: SDKMessage): void {
     if (!this.sink) return;
     if (message.type === "system" && message.subtype === "init") {
+      // Arrives with turn one; the catalog persists it over the placeholder from start().
       this.sink.event({ type: "model", model: message.model });
-      this.resolveIdentity?.({ nativeSessionId: message.session_id, model: message.model });
-      this.resolveIdentity = null;
       return;
     }
     if (message.type === "assistant") {
@@ -377,8 +420,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     }
     if (message.type === "result") {
       this.active = false;
-      this.permission = null;
-      this.question = null;
+      this.rejectInteractions("Turn ended.");
       this.sink.event({
         type: "result",
         success: message.subtype === "success",
@@ -394,12 +436,9 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     }
   }
 
-  private rejectInteractions(): void {
-    const permission = this.permission;
-    this.permission = null;
-    permission?.resolve({ behavior: "deny", message: "Session interrupted." });
-    const question = this.question;
-    this.question = null;
-    question?.resolve({ behavior: "deny", message: "Question cancelled." });
+  private rejectInteractions(reason: string): void {
+    for (const pending of this.interactions.splice(0)) {
+      pending.resolve({ behavior: "deny", message: reason });
+    }
   }
 }
