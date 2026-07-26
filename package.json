@@ -41,6 +41,7 @@
     "build": "tsc --noEmit false --outDir dist --rootDir src",
     "prepack": "npm run build",
     "check": "tsc --noEmit",
+    "sim": "tsx tools/app-tui.ts",
     "test": "tsx --test scripts/test-*.ts",
     "test:app-grok": "tsx --test scripts/test-grok-server.ts",
     "test:app-owned": "tsx --test scripts/test-owned-server.ts",

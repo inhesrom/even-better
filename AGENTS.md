@@ -73,6 +73,14 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   `test-widgets`, `test-menu`, etc.) — pure-function unit tests.
 - End-to-end: `tools/app-sim.ts` records what a connected app receives;
   `tools/analyze-sim.py` scores a recording. See "Verification" below.
+- `pnpm sim` — interactive protocol client standing in for the glasses, not for
+  the agents: it launches a real server via `src/cli.ts` (so real providers,
+  roots and remembered sessions) and attaches, rendering the four consumption
+  semantics and answering permission/question menus. `pnpm sim <port> <token>`
+  attaches to a server already running — use that when one is, since two servers
+  contend for the session store's leases. `pnpm sim --fake grok|owned` swaps in
+  `scripts/fixtures` and reaches no model; that mode offers Codex and Grok only,
+  because Claude has no spawnable fixture (the SDK launches the real CLI).
 - `pnpm test:app-grok` — deterministic full-server Grok protocol test.
 - `pnpm test:app-owned` — deterministic full-server owned-session wizard test.
 - `GROK_SMOKE=1 pnpm smoke:grok` — gated one-prompt real-Grok smoke; never run
@@ -169,7 +177,10 @@ Map `TodoWrite` to `task_progress`, not a tool bubble (`todoProgress` in
 ## Verification (before declaring a nontrivial change done)
 
 `pnpm check` is necessary but not sufficient — the real test is what the glasses
-app receives. Drive it end-to-end:
+app receives. `pnpm sim` drives a whole turn against a real agent, menus
+included; `--fake` swaps in fixtures when the code under test is even-better's
+own plumbing rather than an agent integration. For a recorded, scoreable
+transcript instead:
 
 1. Start a test server on an unused port: `PORT=3457 BRIDGE_TOKEN=... LOG_FILE=/tmp/eb.log LOG=trace pnpm start`.
 2. Create a scratch herdr workspace (`workspace.create` over the socket), run
