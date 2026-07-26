@@ -1,0 +1,9 @@
+// `pnpm check` gate. tsconfig.json stays src-only because `pnpm build` compiles
+// it with --rootDir src; widening that would put scripts/ and tools/ outside the
+// root. Type-checking is a separate concern from emitting, so it gets its own
+// include: tests and tooling are ~4.9k lines that tsx type-erases without
+// checking, so nothing else would catch errors there.
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "tools/**/*.ts"]
+}

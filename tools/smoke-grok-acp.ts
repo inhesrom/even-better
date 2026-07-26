@@ -16,7 +16,11 @@ const token = "grok-smoke-local-token";
 const marker = "GROK_SMOKE_OK";
 
 interface SessionResponse {
-  sessions: Array<{ id: string; provider: string; cwd: string }>;
+  sessions: Array<{ id: string; provider: string; agentProvider?: string; cwd: string }>;
+}
+
+interface PromptResponse {
+  sessionId: string;
 }
 
 interface Message {
@@ -99,14 +103,18 @@ async function stop(child: ChildProcess): Promise<void> {
 }
 
 const cwd = await mkdtemp(path.join(os.tmpdir(), "even-better-grok-smoke-"));
+// Its own state directory: the smoke must never touch the user's remembered
+// sessions or contend for their leases.
+const stateDir = await mkdtemp(path.join(os.tmpdir(), "even-better-grok-smoke-state-"));
 const env = { ...process.env };
 delete env.MUX;
 const child = spawn(process.execPath, ["--import", "tsx", serverEntry], {
   cwd: projectRoot,
   env: {
     ...env,
-    SOURCE: "grok",
-    GROK_CWD: cwd,
+    SOURCE: "owned",
+    WORKSPACE_ROOTS: cwd,
+    EVEN_BETTER_HOME: stateDir,
     BRIDGE_TOKEN: token,
     BIND_HOST: "local",
     PORT: "0",
@@ -121,18 +129,30 @@ child.stderr?.resume();
 
 try {
   const base = await waitForServer(child);
+  // Owned mode starts empty; the stock launcher's first prompt (no sessionId)
+  // creates the setup session, which retains that prompt and dispatches it once
+  // an agent and directory are chosen.
+  assert.deepEqual((await api<SessionResponse>(base, "/sessions")).sessions, []);
+  const created = await api<PromptResponse>(base, "/prompt", {
+    method: "POST",
+    body: JSON.stringify({ text: `Reply exactly ${marker}. Do not use tools.` }),
+  });
+  const sessionId = created.sessionId;
+  assert.match(sessionId, /^owned:/);
+  for (const answer of ["Grok", cwd]) {
+    await api(base, "/question-response", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, answer }),
+    });
+  }
   const sessions = await api<SessionResponse>(base, "/sessions");
   assert.equal(sessions.sessions.length, 1);
   const session = sessions.sessions[0];
-  assert.equal(session.provider, "grok");
+  // "codex" is the stock app's compatibility identity; the real agent is Grok.
+  assert.equal(session.provider, "codex");
+  assert.equal(session.agentProvider, "grok");
   assert.equal(session.cwd, cwd);
-  await api(base, "/prompt", {
-    method: "POST",
-    body: JSON.stringify({
-      sessionId: session.id,
-      text: `Reply exactly ${marker}. Do not use tools.`,
-    }),
-  });
+  assert.equal(session.id, sessionId);
   const completed = await waitForResult(base, session.id);
   const result = completed.messages.find((message) => message.type === "result");
   const prose = completed.messages
@@ -149,4 +169,5 @@ try {
 } finally {
   await stop(child).catch(() => undefined);
   await rm(cwd, { recursive: true, force: true });
+  await rm(stateDir, { recursive: true, force: true });
 }

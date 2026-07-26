@@ -1,10 +1,16 @@
 # Phase 1 — Self-installed agent hooks (herdr/cmux)
 
-> **Status: proposal / not implemented.** Design for moving the *agent-semantic*
-> signals (turn status + session id) off the multiplexer and onto even-better's
-> own Claude/Codex hooks. Phase 1 keeps herdr/cmux for terminal control and only
-> swaps the signal source; tmux (and any terminal) is Phase 2 and becomes small
-> once this is proven.
+> **Status: Phase 1 shipped; kept as the design record.** Moving the
+> *agent-semantic* signals (turn status + session id) off the multiplexer and
+> onto even-better's own Claude/Codex hooks. Phase 1 keeps herdr/cmux for
+> terminal control and only swaps the signal source; tmux (and any terminal) is
+> Phase 2 and is still unimplemented.
+>
+> What exists today: `src/hook-report.ts`, `hook-fsm.ts`, `hook-endpoint.ts`,
+> `hook-install.ts`, `hook-backstop.ts`, `assets/even-better-hook.sh`, the
+> `SELF_HOOK` flag, the `even-better hook-install` / `hook-uninstall` commands,
+> and five test suites. The hook path stays **off by default** — `hookActive`
+> is false unless `SELF_HOOK` routes reports back to this server.
 
 ## Why
 

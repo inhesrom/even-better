@@ -7,6 +7,10 @@ import type { ProviderId } from "./session.js";
 
 const SESSION_ID = /^owned:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 
+// How recently a lease file must have changed for an unreadable one to count as
+// a live writer rather than a dead server's leftovers.
+const LEASE_WRITE_GRACE_MS = 5_000;
+
 export interface RememberedSessionMetadata {
   version: 1;
   id: string;
@@ -187,18 +191,27 @@ export class OwnedSessionStore {
       hostname: os.hostname(),
       startedAt: new Date().toISOString(),
     };
+    // Write the payload first, then link it into place. linkSync is atomic and
+    // still fails EEXIST when the lease is held, so it keeps the mutual
+    // exclusion of open("wx") without that call's window: open-then-write left
+    // the lease file visible but EMPTY, and a second server running
+    // removeStaleLease in that window read it as unparseable, deleted the live
+    // lease, and took its own — two servers then attached the same session.
+    const temporary = path.join(directory, `.lease-${process.pid}-${randomUUID()}.tmp`);
+    fs.writeFileSync(temporary, `${JSON.stringify(lease)}\n`, { encoding: "utf8", mode: 0o600 });
     try {
-      const handle = fs.openSync(target, "wx", 0o600);
-      try {
-        fs.writeFileSync(handle, `${JSON.stringify(lease)}\n`, "utf8");
-      } finally {
-        fs.closeSync(handle);
-      }
+      fs.linkSync(temporary, target);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
         throw new OwnedSessionStoreError(`Session ${id} is attached to another even-better server. Stop that server before resuming or removing it.`);
       }
       throw error;
+    } finally {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {
+        // The link succeeded or never happened; the temp name is disposable.
+      }
     }
     let released = false;
     return () => {
@@ -280,9 +293,21 @@ export class OwnedSessionStore {
     }
   }
 
+  private modifiedWithin(target: string, windowMs: number): boolean {
+    try {
+      return Date.now() - fs.statSync(target).mtimeMs < windowMs;
+    } catch {
+      return false;
+    }
+  }
+
   private removeStaleLease(target: string): void {
     if (!fs.existsSync(target)) return;
     const lease = this.readLease(target);
+    // An unreadable lease that was just touched belongs to a writer we raced,
+    // not to a dead server. Defense in depth behind the atomic link in
+    // acquireLease: never reclaim a lease we cannot prove is abandoned.
+    if (!lease && this.modifiedWithin(target, LEASE_WRITE_GRACE_MS)) return;
     const active = lease && (lease.hostname !== os.hostname() || processExists(lease.pid));
     if (active) return;
     try {

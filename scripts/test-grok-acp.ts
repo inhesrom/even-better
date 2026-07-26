@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
-import { GrokSessionBridge } from "../src/grok-bridge.js";
+import { randomUUID } from "node:crypto";
 import type { GrokConfig } from "../src/grok-config.js";
+import { GrokOwnedAgent } from "../src/grok-owned-agent.js";
+import { OwnedSessionBridge } from "../src/owned-session-bridge.js";
 import { getMessages } from "../src/sse.js";
 
 const fakeGrok = fileURLToPath(new URL("./fixtures/fake-grok.mjs", import.meta.url));
@@ -34,6 +36,12 @@ function config(scenario: string): GrokConfig {
     shutdownTimeoutMs: 500,
     env: { ...process.env, FAKE_GROK_SCENARIO: scenario },
   };
+}
+
+/** Grok reaches the wire through the common owned bridge — the dedicated
+ *  SOURCE=grok bridge was a fork of it and has been retired. */
+function makeBridge(scenario: string): OwnedSessionBridge {
+  return new OwnedSessionBridge(`owned:${randomUUID()}`, new GrokOwnedAgent(config(scenario)));
 }
 
 function messages(sessionId: string): WireMessage[] {
@@ -70,12 +78,14 @@ async function waitForCount(
 }
 
 test("Grok ACP completes streaming, permission, question, tool, usage, and result", async () => {
-  const bridge = new GrokSessionBridge(config("happy"));
+  const bridge = makeBridge("happy");
   try {
-    await bridge.start();
-    const descriptor = await bridge.describe();
-    assert.equal(descriptor.provider, "grok");
-    assert.equal(descriptor.model, "fake-grok-model");
+    const info = await bridge.start();
+    // Owned mode reports "codex" as the wire-compatibility provider; the real
+    // agent behind the session is exposed as agentProvider.
+    assert.equal(bridge.provider, "codex");
+    assert.equal(bridge.agentProvider, "grok");
+    assert.equal(info.model, "fake-grok-model");
 
     await bridge.prompt("Inspect this workspace");
     await waitFor(bridge.id, (message) => message.type === "permission_request");
@@ -123,7 +133,7 @@ test("Grok ACP completes streaming, permission, question, tool, usage, and resul
 });
 
 test("Grok ACP interruption synthesizes tool completion and a failed result", async () => {
-  const bridge = new GrokSessionBridge(config("hang"));
+  const bridge = makeBridge("hang");
   try {
     await bridge.start();
     await bridge.prompt("Start a long operation");
@@ -139,7 +149,7 @@ test("Grok ACP interruption synthesizes tool completion and a failed result", as
 });
 
 test("Grok ACP forwards an offered deny choice without silently allowing the tool", async () => {
-  const bridge = new GrokSessionBridge(config("happy"));
+  const bridge = makeBridge("happy");
   try {
     await bridge.start();
     await bridge.prompt("Inspect this workspace");
@@ -157,7 +167,7 @@ test("Grok ACP forwards an offered deny choice without silently allowing the too
 });
 
 test("Grok ACP sequences multiple select and free-form questions into the official response", async () => {
-  const bridge = new GrokSessionBridge(config("questions"));
+  const bridge = makeBridge("questions");
   try {
     await bridge.start();
     await bridge.prompt("Ask several questions");
@@ -178,7 +188,7 @@ test("Grok ACP sequences multiple select and free-form questions into the offici
 });
 
 test("Grok ACP startup fails clearly when no headless authentication is available", async () => {
-  const bridge = new GrokSessionBridge(config("missing-auth"));
+  const bridge = makeBridge("missing-auth");
   try {
     await assert.rejects(
       bridge.start(),
@@ -190,13 +200,13 @@ test("Grok ACP startup fails clearly when no headless authentication is availabl
 });
 
 test("Grok ACP rejects failed authentication and non-v1 protocol negotiation", async () => {
-  const auth = new GrokSessionBridge(config("auth-error"));
+  const auth = makeBridge("auth-error");
   try {
     await assert.rejects(auth.start(), /Grok authentication failed for cached_token/);
   } finally {
     await auth.dispose();
   }
-  const protocol = new GrokSessionBridge(config("protocol-v2"));
+  const protocol = makeBridge("protocol-v2");
   try {
     await assert.rejects(protocol.start(), /required ACP v1 contract/);
   } finally {
@@ -205,7 +215,7 @@ test("Grok ACP rejects failed authentication and non-v1 protocol negotiation", a
 });
 
 test("Grok ACP keeps a healthy session usable after a sanitized prompt RPC failure", async () => {
-  const bridge = new GrokSessionBridge(config("prompt-error"));
+  const bridge = makeBridge("prompt-error");
   try {
     await bridge.start();
     await bridge.prompt("fail once");
@@ -220,7 +230,7 @@ test("Grok ACP keeps a healthy session usable after a sanitized prompt RPC failu
 });
 
 test("Grok ACP deduplicates protocol event IDs without text deduplication heuristics", async () => {
-  const bridge = new GrokSessionBridge(config("duplicate"));
+  const bridge = makeBridge("duplicate");
   try {
     await bridge.start();
     await bridge.prompt("duplicate frame test");
@@ -237,13 +247,13 @@ test("Grok ACP deduplicates protocol event IDs without text deduplication heuris
 
 test("Malformed or wrong-session ACP makes the public session unavailable", async () => {
   for (const scenario of ["malformed", "wrong-session"]) {
-    const bridge = new GrokSessionBridge(config(scenario));
+    const bridge = makeBridge(scenario);
     try {
       await bridge.start();
       await bridge.prompt("break the protocol");
       const result = await waitFor(bridge.id, (message) => message.type === "result");
       assert.equal(result.success, false);
-      await assert.rejects(bridge.prompt("retry"), /session ended/);
+      await assert.rejects(bridge.prompt("retry"), /session is detached/);
     } finally {
       await bridge.dispose();
     }
@@ -251,13 +261,13 @@ test("Malformed or wrong-session ACP makes the public session unavailable", asyn
 });
 
 test("Grok ACP subprocess crashes become one failed result and an unavailable session", async () => {
-  const bridge = new GrokSessionBridge(config("crash"));
+  const bridge = makeBridge("crash");
   try {
     await bridge.start();
     await bridge.prompt("Crash now");
     const result = await waitFor(bridge.id, (message) => message.type === "result");
     assert.equal(result.success, false);
-    await assert.rejects(bridge.prompt("retry"), /session ended/);
+    await assert.rejects(bridge.prompt("retry"), /session is detached/);
   } finally {
     await bridge.dispose();
   }

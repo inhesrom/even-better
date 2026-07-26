@@ -10,7 +10,7 @@ function usage(): string {
   return `even-better ${VERSION}
 
 Usage:
-  even-better [--source owned|mux|grok] [--workspace-root <path> ...]
+  even-better [--source owned|mux] [--workspace-root <path> ...]
   even-better sessions
   even-better sessions remove <public-id>
   even-better sessions clear
@@ -78,7 +78,7 @@ const positionals: string[] = [];
 for (let index = 0; index < args.length; index++) {
   const argument = args[index];
   if (argument === "--source") {
-    source = args[++index] ?? fail("--source requires owned, mux, or grok.");
+    source = args[++index] ?? fail("--source requires owned or mux.");
   } else if (argument.startsWith("--source=")) {
     source = argument.slice("--source=".length);
   } else if (argument === "--workspace-root") {
@@ -95,8 +95,11 @@ for (let index = 0; index < args.length; index++) {
 if (positionals.some((value) => value !== "hook-install" && value !== "hook-uninstall")) {
   fail(`unknown command ${positionals[0]}. Run even-better --help.`);
 }
-if (source && source !== "owned" && source !== "mux" && source !== "grok") {
-  fail(`invalid --source "${source}". Use owned, mux, or grok.`);
+if (source === "grok") {
+  fail("--source grok has been retired. Use --source owned and pick Grok when the session asks for an agent.");
+}
+if (source && source !== "owned" && source !== "mux") {
+  fail(`invalid --source "${source}". Use owned or mux.`);
 }
 process.env.SOURCE = source ?? process.env.SOURCE ?? "owned";
 if (workspaceRoots.length) {

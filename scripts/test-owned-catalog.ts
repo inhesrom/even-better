@@ -158,6 +158,37 @@ test("the first null-session prompt creates a replayable setup session", async (
   }
 });
 
+test("abandoned setup sessions do not accumulate", async () => {
+  const home = path.join(scratch, "state-setup-eviction");
+  const agents: FakeAgent[] = [];
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents));
+  try {
+    // Every null-session prompt used to mint a permanent map entry — nothing
+    // ever removed one — and setups sort first in list(), so the phone's list
+    // filled with "Setting up agent session…" rows.
+    const ids: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const session = await beginSetup(catalog, `abandoned ${attempt}`);
+      ids.push(session.id);
+    }
+    const listed = await catalog.list();
+    assert.equal(listed.length, 1, `expected one setup row, got ${JSON.stringify(listed.map((s) => s.title))}`);
+    assert.equal(listed[0]?.title, "Setting up agent session…");
+    // Only the newest survives; the abandoned ones are gone from the catalog.
+    assert.equal(listed[0]?.id, ids[ids.length - 1]);
+    for (const id of ids.slice(0, -1)) assert.equal(await catalog.get(id), undefined);
+
+    // A completed setup is a remembered session and is never evicted this way.
+    const live = await setup(catalog, "codex", "keep me");
+    await beginSetup(catalog, "another abandoned");
+    const after = await catalog.list();
+    assert.equal(after.length, 2);
+    assert.ok(after.some((item) => item.id === live.id));
+  } finally {
+    await catalog.dispose();
+  }
+});
+
 test("successful setup persists and dispatches the retained first prompt once", async () => {
   const home = path.join(scratch, "state-retained-prompt");
   const agents: FakeAgent[] = [];

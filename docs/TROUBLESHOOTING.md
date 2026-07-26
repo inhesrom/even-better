@@ -25,9 +25,10 @@ field is derived from the herdr agent name (`codex` -> `codex`, everything else
 spawn or switch the real underlying agent; the bridge mirrors whichever herdr
 pane it targets.
 
-With `SOURCE=grok`, the banner instead reports `Source : grok (ACP stdio)` and
-one `grok:<uuid>` session. There is no pane or transcript path: ACP stdout is the
-structured source.
+Grok has no separate source — it is one of the owned providers, so it shows the
+owned banner below and an `owned:<uuid>` session. There is no pane or transcript
+path for it: ACP stdout is the structured source. (`SOURCE=grok` was retired;
+setting it now fails with a message pointing at owned mode.)
 
 With the default owned source, the banner reports `Source : owned` and the app
 always connects as the Codex compatibility provider. `/api/sessions` returns
@@ -84,7 +85,8 @@ fails, work from the single error line:
 1. `Grok 0.2.103 or newer is required` — run `grok --version` and upgrade.
 2. `authentication is unavailable` — set `XAI_API_KEY` or run `grok login` in
    the same user environment that launches even-better.
-3. `GROK_CWD ...` — use an existing readable/searchable directory.
+3. `Working directory ...` — pick an existing readable/searchable directory
+   inside a workspace root (see `WORKSPACE_ROOTS` / `--workspace-root`).
 4. `timed out` — confirm `grok agent stdio` can start, then increase
    `GROK_STARTUP_TIMEOUT_MS` only if startup is legitimately slow.
 
@@ -263,12 +265,18 @@ curl -sS \
 Inspect `/tmp/even-better-events.log` or `/tmp/even-better-sim.jsonl` for
 `user_prompt`, streamed text/tool events, `result`, and final idle status.
 
-For Grok, omit the pane simulator and launch the owned source directly:
+For Grok, omit the pane simulator and drive the owned wizard directly:
 
 ```bash
-SOURCE=grok GROK_CWD="$PWD" PORT=3457 BRIDGE_TOKEN=test-token QR=0 pnpm start
-curl -sS -H 'Authorization: Bearer test-token' http://127.0.0.1:3457/api/sessions
+PORT=3457 BRIDGE_TOKEN=test-token QR=0 pnpm start
+A=(-sS -H 'Authorization: Bearer test-token' -H 'content-type: application/json')
+# 1. first prompt with no sessionId creates the setup session
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/prompt -d '{"text":"say hi, no tools"}'
+# 2. answer the two setup questions with the returned sessionId
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/question-response -d '{"sessionId":"owned:…","answer":"Grok"}'
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/question-response -d '{"sessionId":"owned:…","answer":"'"$PWD"'"}'
+curl "${A[@]}" http://127.0.0.1:3457/api/sessions
 ```
 
-Use the returned `grok:` session ID in the same prompt command above. A prompt
-that explicitly requests no tools is the cheapest real-agent smoke check.
+The retained first prompt dispatches once setup completes. A prompt that
+explicitly requests no tools is the cheapest real-agent smoke check.

@@ -7,7 +7,7 @@ import {
   type PaneStatus,
   type StatusSub,
 } from "./multiplexer.js";
-import { emit } from "./sse.js";
+import { dropSession, emit } from "./sse.js";
 import { logEvent, tracesStream } from "./log.js";
 import type { AgentEvent, Timeline } from "./spine.js";
 import { CodexTranscriptTimeline, findCodexSessionFile } from "./codex-transcript.js";
@@ -280,7 +280,9 @@ export class PaneBridge implements LiveSession {
   }
 
   start(): void {
-    void this.connect();
+    void this.connect().catch((error) => {
+      console.warn(`[bridge ${this.paneId}] initial connect failed: ${(error as Error).message}`);
+    });
   }
 
   private async connect(): Promise<void> {
@@ -325,7 +327,22 @@ export class PaneBridge implements LiveSession {
     this.timeline = this.screen;
   }
 
+  /** Failing to upgrade is a normal outcome — the poll retries — but the
+   *  filesystem work below can also *throw*: readdirSync hits EACCES, and the
+   *  jsonl can vanish between findSessionFile's existsSync and JsonlTail's
+   *  statSync. Unguarded, that escapes through the un-awaited connect() and the
+   *  poll's setInterval, becoming an uncaughtException that index.ts only logs
+   *  on the mux path — leaving a half-initialized bridge running. */
   private upgradeToTranscript(id: string, fromStart = false): boolean {
+    try {
+      return this.openTranscriptTimeline(id, fromStart);
+    } catch (error) {
+      console.warn(`[bridge ${this.paneId}] transcript upgrade failed: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  private openTranscriptTimeline(id: string, fromStart: boolean): boolean {
     if (this.agent === "claude") {
       const file = findSessionFile(id);
       if (!file) return false;
@@ -636,18 +653,38 @@ export class PaneBridge implements LiveSession {
     }
   }
 
-  private onSubClosed(_err?: Error): void {
+  private onSubClosed(err?: Error): void {
     this.sub = null;
     if (this.disposed) return;
-    // The status stream dropped (mux restarted); retry while the pane still exists.
-    setTimeout(() => {
-      void getMux()
-        .exists(this.paneId)
-        .then((exists) => {
-          if (exists) this.connect();
-          else this.dispose();
-        });
-    }, 2000);
+    if (err) console.warn(`[bridge ${this.paneId}] status stream closed: ${err.message}`);
+    void this.reconnectWhilePaneExists();
+  }
+
+  /** The status stream dropped (mux restarted); retry while the pane still
+   *  exists. Both backends' `exists()` catch every error and return false, so a
+   *  single negative cannot distinguish a closed pane from the very outage that
+   *  just closed this stream — taking one at face value tore down a live bridge
+   *  permanently, and only a later inbound /sessions or /prompt rebuilt it.
+   *  Require the pane to stay absent across several probes before giving up. */
+  private async reconnectWhilePaneExists(): Promise<void> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (this.disposed) return;
+      let exists = false;
+      try {
+        exists = await getMux().exists(this.paneId);
+      } catch {
+        exists = false; // treated as "unknown" by the retry budget above
+      }
+      if (!exists) continue;
+      try {
+        await this.connect();
+      } catch (error) {
+        console.warn(`[bridge ${this.paneId}] reconnect failed: ${(error as Error).message}`);
+      }
+      return;
+    }
+    if (!this.disposed) this.dispose();
   }
 
   // ── status transitions ───────────────────────────────
@@ -862,6 +899,22 @@ export class PaneBridge implements LiveSession {
     }
   }
 
+  /** Re-read a blocked pane's screen a couple of times. Null when it stays
+   *  unreadable, so the caller can degrade to a notification instead of
+   *  silently abandoning the interaction. */
+  private async readBlockedScreen(mux: ReturnType<typeof getMux>): Promise<string | null> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (this.disposed || this.state !== "awaiting") return null;
+      try {
+        return await mux.read(this.paneId, 45);
+      } catch {
+        // Keep trying; the caller notifies once the attempts are spent.
+      }
+    }
+    return null;
+  }
+
   private async emitBlockedMenu(): Promise<void> {
     // Give the TUI a beat to finish painting the menu before reading it.
     await new Promise((r) => setTimeout(r, 400));
@@ -875,8 +928,25 @@ export class PaneBridge implements LiveSession {
     let screen = "";
     try {
       screen = await mux.read(this.paneId, 45);
-    } catch {
-      return;
+    } catch (error) {
+      // Returning here used to strand the session: the pane is already
+      // "awaiting", and emitBlockedMenu is reached ONLY on the edge transition
+      // into that state (the caller guards on `state !== "awaiting"`), so
+      // nothing re-enters for this block. The glasses would show a frozen
+      // session with no menu to answer. Retry, then fall back to telling the
+      // user where the prompt actually is — never leave without emitting.
+      logEvent("diag", this.paneId, { blockedReadFailed: (error as Error).message });
+      const retried = await this.readBlockedScreen(mux);
+      if (this.state !== "awaiting") return; // resolved while retrying
+      if (retried === null) {
+        emit(this.paneId, {
+          type: "notification",
+          title: "Agent waiting",
+          message: "A prompt is open but the pane could not be read — please respond in the terminal",
+        });
+        return;
+      }
+      screen = retried;
     }
     // agent.explain is an optional Multiplexer capability (herdr only). Without
     // it (cmux), fall back to screen classification alone.
@@ -1210,11 +1280,17 @@ export class PaneBridge implements LiveSession {
     const menu = this.currentMenu;
     this.currentMenu = null;
     // The app may send a plain label or a JSON map of {question: label}.
+    // Parse to unknown and narrow, as every other answer-normalization site
+    // does: `JSON.parse("5")` and `JSON.parse("[1,2]")` both satisfy a
+    // `Record<string, string>` cast, so the cast asserted something the code
+    // then had to defend against at runtime anyway.
     let label = answer;
     try {
-      const parsed = JSON.parse(answer) as Record<string, string>;
-      const first = Object.values(parsed)[0];
-      if (typeof first === "string") label = first;
+      const parsed: unknown = JSON.parse(answer);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        const first = Object.values(parsed)[0];
+        if (typeof first === "string") label = first;
+      }
     } catch {
       // plain string
     }
@@ -1268,6 +1344,7 @@ export class PaneBridge implements LiveSession {
     this.out.clear();
     this.timeline?.dispose();
     this.sub?.close();
+    dropSession(this.paneId);
     console.log(`[bridge ${this.paneId}] disposed`);
   }
 }

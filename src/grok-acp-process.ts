@@ -370,7 +370,7 @@ export class GrokAcpProcess {
         } catch (error) {
           if (/timed out/.test(safeError(error))) throw error;
           throw new Error(
-            "Grok could not create a session in GROK_CWD. Check directory access and Grok configuration.",
+            "Grok could not create a session in the chosen directory. Check directory access and Grok configuration.",
           );
         }
       }
@@ -619,7 +619,13 @@ export class GrokAcpProcess {
     this.fatalEmitted = true;
     this.available = false;
     this.emit({ type: "fatal", message });
-    void this.dispose();
+    // Best-effort teardown. disposeOwned() throws when the process group cannot
+    // be reaped; unhandled here that rejection reaches index.ts's
+    // unhandledRejection handler, which calls shutdown(1) for owned/grok — so
+    // one un-reapable child would take down the whole server.
+    void this.dispose().catch((error) => {
+      console.warn(`[grok] teardown after fatal failed: ${(error as Error).message}`);
+    });
   }
 
   dispose(): Promise<void> {

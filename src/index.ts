@@ -22,8 +22,7 @@ import {
   hooksInstalled,
 } from "./hook-install.js";
 import { maskToken, printConnect } from "./connect-url.js";
-import { resolveGrokConfig, resolveSource, type SourceMode } from "./grok-config.js";
-import { GrokSessionCatalog } from "./grok-session-catalog.js";
+import { resolveSource, type SourceMode } from "./grok-config.js";
 import { MuxSessionCatalog } from "./mux-session-catalog.js";
 import { resolveOwnedConfig } from "./owned-config.js";
 import { OwnedSessionCatalog } from "./owned-session-catalog.js";
@@ -147,7 +146,7 @@ function resolveToken(): string {
   return randomBytes(24).toString("hex");
 }
 const TOKEN = resolveToken();
-let defaultProvider: ProviderId = sourceMode === "grok" ? "grok" : sourceMode === "owned" ? "codex" : "claude";
+let defaultProvider: ProviderId = sourceMode === "owned" ? "codex" : "claude";
 
 function controlError(res: Response, err: unknown): void {
   const status = err instanceof SessionControlError ? err.status : 500;
@@ -546,8 +545,6 @@ try {
   if (sourceMode === "mux") {
     setMux(await selectMux());
     catalog = new MuxSessionCatalog();
-  } else if (sourceMode === "grok") {
-    catalog = await GrokSessionCatalog.start(resolveGrokConfig(process.env));
   } else {
     catalog = new OwnedSessionCatalog(resolveOwnedConfig(process.env));
   }
@@ -562,7 +559,7 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
   console.log("");
   console.log(`  even-better v${VERSION}`);
   console.log(`  Instance : ${INSTANCE_ID}`);
-  console.log(`  Source   : ${sourceMode === "mux" ? `mux (${getMux().name})` : sourceMode === "grok" ? "grok (ACP stdio)" : "owned (per-session agent)"}`);
+  console.log(`  Source   : ${sourceMode === "mux" ? `mux (${getMux().name})` : "owned (per-session agent)"}`);
   console.log(`  Bind     : ${bind.label}`);
   console.log(`  Local    : http://${bind.bindHost === "0.0.0.0" ? "127.0.0.1" : bind.bindHost}:${actualPort}`);
   if (basePaths.length > 0) console.log(`  Paths    : ${basePaths.join(", ")}`);
@@ -584,7 +581,7 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
       console.log(`  agent : none yet — start claude or codex inside ${getMux().name}; it's picked up automatically (no restart).`);
     }
   } catch (err) {
-    const source = sourceMode === "mux" ? getMux().name : sourceMode === "grok" ? "grok ACP" : "owned agents";
+    const source = sourceMode === "mux" ? getMux().name : "owned agents";
     console.error(`  ${source} : NOT REACHABLE — ${(err as Error).message}`);
   }
 
@@ -681,8 +678,18 @@ function shutdown(code: number): void {
   server.close();
   void teardown().finally(() => process.exit(code));
 }
-process.on("SIGINT", () => shutdown(0));
-process.on("SIGTERM", () => shutdown(0));
+// A repeated signal force-quits. teardown() is bounded (every provider dispose
+// has a timeout), but this keeps Ctrl-C escapable if one ever wedges — expose.ts
+// deliberately no longer installs its own exit-forcing signal handlers.
+function onSignal(code: number): void {
+  if (shuttingDown) {
+    console.error("[bridge] second signal — exiting without finishing teardown");
+    process.exit(code);
+  }
+  shutdown(code);
+}
+process.on("SIGINT", () => onSignal(0));
+process.on("SIGTERM", () => onSignal(0));
 process.on("uncaughtException", (err) => {
   console.error(`[bridge] uncaught: ${err.message}\n${err.stack}`);
   if (sourceMode !== "mux") shutdown(1);

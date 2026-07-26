@@ -28,27 +28,34 @@ seams belong only where a second real implementation is coming.
 
 ## Implemented runtime source boundary
 
-`SOURCE=owned` (the CLI default), `SOURCE=mux`, and `SOURCE=grok` are selected once at launch. HTTP
-routes depend on the small `SessionCatalog` / `LiveSession` boundary in
+`SOURCE=owned` (the CLI default) and `SOURCE=mux` are selected once at launch.
+HTTP routes depend on the small `SessionCatalog` / `LiveSession` boundary in
 `src/session.ts`, rather than knowing how a session is produced.
 
 ```text
                        SessionCatalog / LiveSession
                       ┌─────────────────────────────┐
-MuxSessionCatalog ───►│ list, get, default, prompt, │◄─── GrokSessionCatalog
-  └─ PaneBridge       │ respond, interrupt, dispose │       └─ GrokSessionBridge
-                      └──────────────┬──────────────┘          └─ GrokAcpProcess
+MuxSessionCatalog ───►│ list, get, default, prompt, │◄─── OwnedSessionCatalog
+  └─ PaneBridge       │ respond, interrupt, dispose │       └─ OwnedSessionBridge
+                      └──────────────┬──────────────┘          └─ OwnedAgent
                                      │
                               HTTP/SSE protocol
 ```
 
 This boundary is intentionally narrower than the aspirational event-spine
-design below. It lets the ACP implementation coexist with `PaneBridge` without
+design below. It lets the owned implementation coexist with `PaneBridge` without
 refactoring the mature Claude/Codex transcript and multiplexer paths. The mux
-adapter delegates to the existing bridge manager; the Grok adapter owns exactly
-one child and one session.
+adapter delegates to the existing bridge manager.
 
-Owned mode adds a third catalog without changing either existing path:
+There was briefly a third catalog, `SOURCE=grok`, with its own
+`GrokSessionBridge`. It has been **retired**: that bridge was a fork of
+`OwnedSessionBridge` (81 byte-identical lines) wrapping the same
+`GrokAcpProcess` that owned mode already drives, so it added a parallel sink
+layer without adding capability. Grok is now one `OwnedAgent` among three. Read
+this as the standing rule — a second *implementation* earns a seam; a second
+*copy* does not.
+
+Owned mode's catalog, in more detail:
 
 ```text
 OwnedSessionCatalog
@@ -233,7 +240,7 @@ class Session {
 }
 ```
 
-Notice what left the core versus today's 800-line `PaneBridge`: dedup, volatile
+Notice what left the core versus today's ~1,100-line `PaneBridge`: dedup, volatile
 filtering, menu parsing, key grammar, herdr calls, wire formatting — every one
 of them now has a home on the producer or consumer side. The core is just the
 turn state machine.

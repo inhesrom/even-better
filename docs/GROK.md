@@ -1,9 +1,16 @@
-# Grok ACP source
+# Grok
 
-The standalone Grok source is an explicit alternative to default persistent
-owned mode. It launches one Grok CLI child, creates one fresh ACP
-session, and exposes that session through the existing Even-app HTTP/SSE
-protocol.
+Grok runs as an owned agent: even-better launches one Grok CLI child, creates or
+resumes one ACP session, and exposes it through the Even-app HTTP/SSE protocol
+like any other provider.
+
+> **`SOURCE=grok` has been retired.** It was a standalone source with its own
+> catalog and bridge (`grok-session-catalog.ts`, `grok-bridge.ts`), but that
+> bridge was a fork of the common `OwnedSessionBridge` — 81 of its lines were
+> byte-identical to it — wrapping the *same* `GrokAcpProcess` that owned mode
+> already drives. Owned mode supersedes it with no loss of capability, and adds
+> persistence, resume, and multiple concurrent sessions. `SOURCE=grok` and
+> `--source grok` now fail with a message pointing here.
 
 ## Launch
 
@@ -11,20 +18,23 @@ Requirements:
 
 - Grok CLI 0.2.103 or newer on `PATH` (or set `GROK_BIN`)
 - an existing `grok login`, or `XAI_API_KEY` in even-better's environment
-- an accessible working directory
+- a working directory inside an approved workspace root
 
 ```bash
-GROK_CWD=/absolute/path/to/project even-better --source grok
+even-better                      # owned mode is the default
+even-better --workspace-root /absolute/path/to/project
 ```
 
-Do not set `MUX` with `SOURCE=grok`. An ordinary `even-better` launch uses
-persistent owned mode; `even-better --source mux` explicitly preserves the
-existing Claude/Codex mirror behavior.
+Then start a session from the app's **＋ New Session** row: the first prompt
+opens the setup wizard, which asks for an agent (choose **Grok**) and a
+directory. The chosen directory must be an eligible descendant of a workspace
+root — unlike the old `GROK_CWD`, it is validated against that policy rather
+than taken from the environment.
 
 Startup is fail-closed. even-better checks the CLI version, launches
 `grok --no-auto-update agent stdio`, negotiates ACP v1, chooses headless API-key
-or cached-token authentication, and creates a session with `GROK_CWD`. The HTTP
-server starts only after all of those steps succeed.
+or cached-token authentication, and creates a session in the chosen directory.
+The session only becomes remembered once all of those steps succeed.
 
 ## Session behavior
 
@@ -42,9 +52,11 @@ Unsupported image, audio, embedded-resource, or terminal-content payloads are
 not forwarded to the glasses. The user receives one notification for the turn;
 ordinary text and tool metadata continue normally.
 
-The session ID printed by `/api/sessions` starts with `grok:`. It is an
+The session ID printed by `/api/sessions` starts with `owned:`. It is an
 even-better public ID; Grok's private ACP session, prompt, tool, and permission
-IDs never cross the HTTP boundary.
+IDs never cross the HTTP boundary. As in all owned sessions the wire `provider`
+is `codex` (the stock app's compatibility identity) and the real agent appears
+as `agentProvider: "grok"` and in the session title.
 
 ## Process and secrets
 
@@ -60,9 +72,12 @@ session unavailable until even-better is restarted.
 
 ## Configuration
 
+The working directory comes from the setup wizard and the workspace-root policy
+(`WORKSPACE_ROOTS` / `--workspace-root`), not from an environment variable;
+`GROK_CWD` was part of the retired standalone source and is no longer read.
+
 | Variable | Default | Contract |
 | --- | --- | --- |
-| `GROK_CWD` | required | Canonical accessible session working directory |
 | `GROK_BIN` | `grok` | Executable name or executable file path |
 | `GROK_STARTUP_TIMEOUT_MS` | `15000` | 1000–120000 ms total startup deadline |
 | `GROK_CANCEL_TIMEOUT_MS` | `5000` | 250–60000 ms cancellation deadline |
@@ -78,14 +93,17 @@ shutdown, and the full HTTP protocol. Run:
 ```bash
 pnpm check
 pnpm test
-pnpm test:app-grok
+pnpm test:grok                # Grok ACP over the owned bridge
 GROK_SMOKE=1 pnpm smoke:grok  # makes one real model request
 ```
 
-For a real local smoke test, launch with `QR=0`, call `/api/sessions`, submit a
-minimal no-tool prompt, and confirm the event log contains `user_prompt`,
-`text_delta`, `result`, then `status` with `state:"idle"`. A glasses test uses
-the same launch command without `QR=0`; scan the printed URL in the Even App.
+`pnpm sim --fake` drives the whole wizard against the deterministic ACP fixture
+without reaching a model — pick **Grok** when it asks for an agent.
+
+For a real local smoke test, launch with `QR=0`, drive the wizard via
+`POST /api/prompt` + `/api/question-response`, and confirm the event log contains
+`user_prompt`, `text_delta`, `result`, then `status` with `state:"idle"`. A
+glasses test uses the same launch without `QR=0`; scan the printed URL.
 
 ## Deliberate v1 limits
 

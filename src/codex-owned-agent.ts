@@ -235,11 +235,20 @@ export class CodexOwnedAgent implements OwnedAgent {
 
   async dispose(): Promise<void> {
     if (this.closing) {
-      if (this.exitPromise) await this.exitPromise;
+      // Bounded: an unkillable child must not wedge a second dispose() caller.
+      if (this.exitPromise) {
+        await withTimeout(this.exitPromise, this.config.shutdownTimeoutMs, "Codex shutdown timed out.").catch(
+          () => undefined,
+        );
+      }
       return;
     }
     this.closing = true;
-    this.cancelInteractions();
+    try {
+      this.cancelInteractions();
+    } catch {
+      // Writing a cancellation to a dead stdin throws; teardown continues.
+    }
     if (this.active && this.threadId && this.turnId) {
       try {
         await withTimeout(
@@ -262,7 +271,15 @@ export class CodexOwnedAgent implements OwnedAgent {
         await withTimeout(this.exitPromise ?? Promise.resolve(), this.config.shutdownTimeoutMs, "Codex TERM shutdown timed out.");
       } catch {
         this.signalChild("SIGKILL");
-        if (this.exitPromise) await this.exitPromise;
+        // Bounded like every step above it. An unkillable child would otherwise
+        // hang dispose() -> catalog.dispose() -> teardown() forever.
+        if (this.exitPromise) {
+          try {
+            await withTimeout(this.exitPromise, this.config.shutdownTimeoutMs, "Codex KILL shutdown timed out.");
+          } catch {
+            console.warn(`[codex] child ${child.pid ?? "?"} did not exit after SIGKILL`);
+          }
+        }
       }
     }
     this.child = null;

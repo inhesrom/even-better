@@ -2,7 +2,10 @@
 // (GET /sessions, SSE /events with needReplay, periodic /sessions polls) and
 // records every SSE event to a JSONL file for offline analysis.
 //
-// Usage: tsx scripts/app-sim.ts <port> <token> <sessionId> <outFile> [durationMs]
+// Superseded for interactive use by tools/app-tui.ts (`pnpm sim`); kept because
+// it is the only thing that produces a scoreable recording for analyze-sim.py.
+//
+// Usage: tsx tools/app-sim.ts <port> <token> <sessionId> <outFile> [durationMs]
 
 const [port, token, sessionId, outFile, durationArg] = process.argv.slice(2);
 const durationMs = parseInt(durationArg ?? "60000", 10);

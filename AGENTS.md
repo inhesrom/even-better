@@ -9,8 +9,9 @@ server speaks the `@evenrealities/even-terminal` protocol so the stock Even app
 connects by QR scan. The installed CLI defaults to `SOURCE=owned`: setup-first,
 persistent phone sessions that choose Claude, Codex, or Grok plus an eligible
 directory. Explicit `SOURCE=mux` mirrors Claude/Codex already running in herdr
-or cmux. Explicit `SOURCE=grok` owns one fresh `grok agent stdio` ACP session in
-`GROK_CWD`.
+or cmux. (`SOURCE=grok` was a third mode owning one `grok agent stdio` ACP
+session; it was a fork of the owned bridge and has been retired — owned mode
+runs the same ACP child.)
 
 ## Architecture
 
@@ -56,32 +57,43 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - **`owned-workspaces.ts` / `owned-config.ts` / `owned-session-store.ts`** —
   realpath-enforced directory policy, MRU choices, atomic private persistence,
   leases, executable discovery, limits, and child configuration.
-- **`grok-acp-process.ts` / `grok-acp-normalize.ts` / `grok-bridge.ts`** — owned
-  Grok child + ACP SDK, exhaustive wire normalization, and even-terminal event
-  mapping. Keep ACP/private IDs on this producer side.
-- **`expose.ts`** — public tunnel used by the tunnel `ACCESS` modes (`tailscale-funnel`/`funnel`|`pinggy`|`bore`|`ngrok`|`cloudflared`): spawns the tunnel CLI, scrapes its URL, prints the one QR. `funnel` (Tailscale) is SSE-verified + auto-tears-down on exit; Cloudflare *quick* tunnels break SSE — noted inline. `index.ts`'s `resolveAccess()` picks the provider and calls `startExpose(name, …)`.
+- **`grok-acp-process.ts` / `grok-acp-normalize.ts` / `grok-owned-agent.ts`** —
+  owned Grok child + ACP SDK, exhaustive wire normalization, and the `OwnedAgent`
+  mapping. Keep ACP/private IDs on this producer side. Grok reaches the wire
+  through the common `OwnedSessionBridge` like every other provider.
+- **`agent-home.ts`** — where the agent CLIs keep per-user state
+  (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Shared so the transcript tailer and the
+  hook installer cannot disagree; when they did, the transcript never resolved
+  and transcript-only panes showed nothing at all.
+- **`expose.ts`** — public tunnel used by the tunnel `PUBLIC_ACCESS` modes (`tailscale-funnel`/`funnel`|`pinggy`|`bore`|`ngrok`|`cloudflared`): spawns the tunnel CLI, scrapes its URL, prints the one QR. `funnel` (Tailscale) is SSE-verified + auto-tears-down on exit; Cloudflare *quick* tunnels break SSE — noted inline. `index.ts`'s `resolveAccess()` picks the provider and calls `startExpose(name, …)`. It registers only a `process.on("exit")` teardown — a signal handler here would `process.exit()` synchronously and pre-empt `index.ts`'s async shutdown, orphaning the detached owned children.
 - **`sse.ts` / `index.ts`** — even-terminal SSE fan-out + HTTP server.
 - **`parse.ts`** — screen menu parsing (`parseMenu`/`classifyMenu`).
 
 ## Commands
 
-- `pnpm start` — run the server (prints QR). No build step; runs via `tsx`.
-- `pnpm check` — `tsc --noEmit`. Must pass before every commit.
+- `pnpm start` — run the server (prints QR). Runs via `tsx`, no build needed.
+  `pnpm build` is for packaging only (`bin` → `dist/cli.js`); CI runs it so the
+  shipped artifact stays compilable.
+- `pnpm check` — `tsc --noEmit -p tsconfig.check.json`, covering `src/`,
+  `scripts/`, and `tools/`. Must pass before every commit. (The root
+  `tsconfig.json` stays `src`-only because `pnpm build` compiles it with
+  `--rootDir src`; checking and emitting are separate configs on purpose.)
 - `pnpm test` — runs every `scripts/test-*.ts` suite via the `node:test` runner.
   Run one suite after touching its module with
   `npx tsx --test scripts/test-transcript.ts` (or `test-render`, `test-diff-unit`,
   `test-widgets`, `test-menu`, etc.) — pure-function unit tests.
-- End-to-end: `tools/app-sim.ts` records what a connected app receives;
-  `tools/analyze-sim.py` scores a recording. See "Verification" below.
+- End-to-end: `pnpm sim` (`tools/app-tui.ts`) is the maintained client. The older
+  `tools/app-sim.ts` + `tools/analyze-sim.py` pair still records/scores a JSONL
+  transcript when you want a scoreable artifact. See "Verification" below.
 - `pnpm sim` — interactive protocol client standing in for the glasses, not for
   the agents: it launches a real server via `src/cli.ts` (so real providers,
   roots and remembered sessions) and attaches, rendering the four consumption
   semantics and answering permission/question menus. `pnpm sim <port> <token>`
   attaches to a server already running — use that when one is, since two servers
-  contend for the session store's leases. `pnpm sim --fake grok|owned` swaps in
+  contend for the session store's leases. `pnpm sim --fake` swaps in
   `scripts/fixtures` and reaches no model; that mode offers Codex and Grok only,
   because Claude has no spawnable fixture (the SDK launches the real CLI).
-- `pnpm test:app-grok` — deterministic full-server Grok protocol test.
+- `pnpm test:grok` — deterministic Grok ACP protocol test over the owned bridge.
 - `pnpm test:app-owned` — deterministic full-server owned-session wizard test.
 - `GROK_SMOKE=1 pnpm smoke:grok` — gated one-prompt real-Grok smoke; never run
   in ordinary tests or without accepting model usage.
@@ -128,6 +140,23 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   never fall back between sources, never expose ACP IDs/frames, and never signal
   a process other than the validated child/group created by `GrokAcpProcess`.
   Shutdown remains cancel → optional advertised close → EOF → TERM → KILL.
+  `GrokAcpProcess.fatal()` must `.catch()` its own `dispose()`: `disposeOwned()`
+  throws when the group will not reap, and an unhandled rejection reaches
+  `index.ts`, which calls `shutdown(1)` — one stuck child would exit the server.
+- **Every provider teardown is bounded, and the lease outlives it.** Each dispose
+  step takes a timeout (an unbounded `await exitPromise` wedged `dispose()` →
+  `catalog.dispose()` → `teardown()`), and `OwnedCatalogSession.dispose()`
+  releases its lease in a `finally` so a throwing teardown cannot strand
+  `lease.json` on disk.
+- **A blocked pane must always emit something.** `emitBlockedMenu` runs only on
+  the edge transition into `awaiting`, so returning early without emitting
+  strands the session with no menu on the glasses and nothing to re-enter the
+  method. Retry, then fall back to a `notification` — never return silently.
+- **Leases become visible only with their payload.** `acquireLease` writes a temp
+  file and `link`s it into place (atomic, still `EEXIST` when held). The earlier
+  `open("wx")`-then-write left the file visible but empty, and a second server
+  read it as unparseable, judged it abandoned, and unlinked a live lease — two
+  servers then attached the same session.
 - **Owned Claude startup must never wait for `system/init`.** The Agent SDK emits
   that message only once a turn begins, and the first prompt is not sent until
   `start()` resolves — waiting on it deadlocks until the startup timeout, every
@@ -190,7 +219,7 @@ transcript instead:
    confirm the exact events the app got.
 4. Clean up the scratch workspace (`workspace.close`) afterward.
 
-For Grok changes, also run `pnpm test:app-grok`. The real pre-release gate is
+For Grok changes, also run `pnpm test:grok`. The real pre-release gate is
 `GROK_SMOKE=1 pnpm smoke:grok`; it creates and removes its own empty cwd and
 makes exactly one no-tool model request.
 

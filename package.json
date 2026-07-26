@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "assets",
     "docs",
     "README.md",
     "SECURITY.md",
@@ -40,11 +41,11 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc --noEmit false --outDir dist --rootDir src",
     "prepack": "npm run build",
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit -p tsconfig.check.json",
     "sim": "tsx tools/app-tui.ts",
     "test": "tsx --test scripts/test-*.ts",
-    "test:app-grok": "tsx --test scripts/test-grok-server.ts",
     "test:app-owned": "tsx --test scripts/test-owned-server.ts",
+    "test:grok": "tsx --test scripts/test-grok-acp.ts",
     "smoke:grok": "tsx tools/smoke-grok-acp.ts",
     "smoke:claude": "tsx tools/smoke-owned-agent.ts claude",
     "smoke:codex": "tsx tools/smoke-owned-agent.ts codex"

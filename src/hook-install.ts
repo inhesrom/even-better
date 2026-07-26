@@ -8,6 +8,7 @@ import { copyFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFile
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { claudeConfigDir, codexHome } from "./agent-home.js";
 
 // Our command references the script by this basename, so it is identifiable for
 // idempotent re-install and clean uninstall without a separate marker field.
@@ -120,8 +121,7 @@ function bundledScriptPath(): string {
 }
 
 function claudeSettingsPath(): string {
-  const dir = process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
-  return join(dir, "settings.json");
+  return join(claudeConfigDir(), "settings.json");
 }
 
 /** Read existing settings. `{}` when the file is absent (fresh install). **Throws**
@@ -206,11 +206,6 @@ export function shellSingleQuote(s: string): string {
  *  local socket write. Identifiable by the script basename (HOOK_MARKER) for uninstall. */
 export function codexHookEntry(scriptPath: string): HookEntry {
   return { type: "command", command: `sh ${shellSingleQuote(scriptPath)} codex`, timeout: 5 };
-}
-
-function codexHome(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  return raw ? raw : join(homedir(), ".codex");
 }
 
 function codexHooksPath(): string {

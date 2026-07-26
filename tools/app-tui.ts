@@ -9,7 +9,7 @@
 //
 // Usage: tsx tools/app-tui.ts [cli args…]      launch a real server, then attach
 //        tsx tools/app-tui.ts <port> <token>   attach to a server already running
-//        tsx tools/app-tui.ts --fake [grok|owned]   fixtures only, no model calls
+//        tsx tools/app-tui.ts --fake             fixtures only, no model calls
 
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -29,7 +29,7 @@ const tsxLoader = fileURLToPath(import.meta.resolve("tsx"));
 const SIM_TOKEN = "even-better-sim-token";
 const USAGE = `usage: pnpm sim [cli args…]          launch a real server, then attach
        pnpm sim <port> <token>       attach to a server already running
-       pnpm sim --fake [grok|owned]  fixtures only, no model calls
+       pnpm sim --fake              fixtures only, no model calls
 
 Stands in for the glasses, not for the agents. Extra arguments in the first form
 go to src/cli.ts, so --source and --workspace-root work as they do for pnpm start.`;
@@ -163,20 +163,20 @@ async function startReal(args: string[]): Promise<Server> {
  *  spawnable fixture — `ClaudeOwnedAgent` drives the in-process SDK, which
  *  launches the real CLI, so faking it means implementing the Claude Code
  *  stream-json control protocol. Use real mode to exercise Claude. */
-async function startFake(kind: "grok" | "owned"): Promise<Server> {
-  const workspace = await mkdtemp(path.join(os.tmpdir(), `even-better-sim-${kind}-`));
+async function startFake(): Promise<Server> {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "even-better-sim-owned-"));
   const env: NodeJS.ProcessEnv = { ...process.env };
   // An ambient MUX would pull in a real multiplexer and defeat the point.
   delete env.MUX;
-  const specific: NodeJS.ProcessEnv =
-    kind === "grok"
-      ? { SOURCE: "grok", GROK_CWD: workspace }
-      : {
-          SOURCE: "owned",
-          WORKSPACE_ROOTS: workspace,
-          EVEN_BETTER_HOME: path.join(workspace, ".even-better-state"),
-          CLAUDE_BIN: path.join(workspace, "missing-claude"),
-        };
+  // Owned mode covers both fixtures: the setup wizard offers Codex and Grok,
+  // whose *_BIN below point at the fakes. (SOURCE=grok was a separate standalone
+  // mode over the same ACP child and has been retired.)
+  const specific: NodeJS.ProcessEnv = {
+    SOURCE: "owned",
+    WORKSPACE_ROOTS: workspace,
+    EVEN_BETTER_HOME: path.join(workspace, ".even-better-state"),
+    CLAUDE_BIN: path.join(workspace, "missing-claude"),
+  };
   return launch(
     serverEntry,
     [],
@@ -578,12 +578,9 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (fakeAt >= 0) {
-    const kind = args[fakeAt + 1] === "owned" ? "owned" : "grok";
-    say(`fake ${kind} server — fixtures only, no model calls`);
-    if (kind === "owned") {
-      say(dim("  wizard offers Codex and Grok; Claude has no fixture — use `pnpm sim` to exercise it"));
-    }
-    server = await startFake(kind);
+    say("fake owned server — fixtures only, no model calls");
+    say(dim("  wizard offers Codex and Grok; Claude has no fixture — use `pnpm sim` to exercise it"));
+    server = await startFake();
     token = SIM_TOKEN;
   } else if (/^\d+$/.test(args[0] ?? "")) {
     const [port, argToken] = args;

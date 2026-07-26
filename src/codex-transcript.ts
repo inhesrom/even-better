@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { codexHome } from "./agent-home.js";
 import type { AgentEvent, Timeline } from "./spine.js";
 import { JsonlTail } from "./jsonl-tail.js";
 
@@ -16,11 +16,6 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function readDirEntries(dir: string) {
   return readdirSync(dir, { withFileTypes: true });
-}
-
-function codexHome(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  return raw ? raw : join(homedir(), ".codex");
 }
 
 export function findCodexSessionFile(sessionId: string): string | null {

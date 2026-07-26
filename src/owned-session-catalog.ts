@@ -22,7 +22,7 @@ import {
   type SessionHistoryEntry,
   type SessionState,
 } from "./session.js";
-import { emit } from "./sse.js";
+import { dropSession, emit } from "./sse.js";
 
 type AgentFactory = (provider: ProviderId, cwd: string, config: OwnedProviderConfig) => OwnedAgent;
 
@@ -114,6 +114,11 @@ class OwnedCatalogSession implements LiveSession {
 
   get hasLease(): boolean {
     return this.releaseLease !== null;
+  }
+
+  /** A setup session still in the wizard: no provider started, none starting. */
+  get isPendingSetup(): boolean {
+    return this.setup !== null && !this.setup.starting;
   }
 
   get isIdleAttached(): boolean {
@@ -245,8 +250,18 @@ class OwnedCatalogSession implements LiveSession {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    await this.detach();
-    this.releaseCatalogLease();
+    // The lease must be released even when the provider teardown throws (a
+    // Grok process group that will not reap does), or shutdown leaves a live
+    // lease.json behind and the session is unattachable until it goes stale.
+    try {
+      await this.detach();
+    } finally {
+      this.releaseCatalogLease();
+      // Terminal for this public id (shutdown, or an abandoned setup evicted by
+      // createSetup) — detach alone must NOT drop it, since a remembered session
+      // keeps its id and re-attaches later.
+      dropSession(this.id);
+    }
   }
 
   installAttached(bridge: OwnedSessionBridge): void {
@@ -489,6 +504,18 @@ export class OwnedSessionCatalog implements SessionCatalog {
   }
 
   private createSetup(): OwnedCatalogSession {
+    // At most one setup is ever in flight: the stock app renders a single
+    // ＋ New Session row, and the wizard state lives on the session its first
+    // prompt created. A fresh null-session prompt means the user restarted the
+    // flow, so the previous unfinished setup is dead. Without this, every such
+    // prompt would leak a permanent map entry — and setups sort first in
+    // list(), so the phone's list fills with "Setting up agent session…" rows.
+    // Sessions that are mid-launch (starting) or already promoted are kept.
+    for (const [id, existing] of [...this.sessions]) {
+      if (!existing.isPendingSetup) continue;
+      this.sessions.delete(id);
+      void existing.dispose().catch(() => undefined);
+    }
     const session = new OwnedCatalogSession(`owned:${randomUUID()}`, this);
     this.sessions.set(session.id, session);
     return session;

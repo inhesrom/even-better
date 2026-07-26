@@ -1,7 +1,10 @@
-import fs from "node:fs";
-import path from "node:path";
+// Grok's child-process config shape and version policy. Grok itself is reached
+// through owned mode (GrokOwnedAgent); the dedicated SOURCE=grok catalog and
+// bridge were a fork of the common owned bridge and have been retired, so the
+// standalone GROK_CWD/GROK_BIN resolver went with them — owned mode discovers
+// executables through owned-config.ts.
 
-export type SourceMode = "mux" | "grok" | "owned";
+export type SourceMode = "mux" | "owned";
 
 export interface GrokConfig {
   bin: string;
@@ -22,83 +25,15 @@ export class GrokConfigError extends Error {
 export function resolveSource(env: NodeJS.ProcessEnv): SourceMode {
   const raw = env.SOURCE;
   if (raw === undefined || raw === "" || raw === "mux") return "mux";
-  if (raw === "grok") return "grok";
   if (raw === "owned") return "owned";
-  throw new GrokConfigError(`invalid SOURCE "${raw}". Use mux, grok, or owned.`);
+  if (raw === "grok") {
+    throw new GrokConfigError(
+      'SOURCE=grok has been retired. Use SOURCE=owned and pick Grok when the session asks for an agent — it runs the same ACP child.',
+    );
+  }
+  throw new GrokConfigError(`invalid SOURCE "${raw}". Use mux or owned.`);
 }
 
-function integerSetting(
-  env: NodeJS.ProcessEnv,
-  name: string,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  const raw = env[name];
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const value = Number(raw.trim());
-  if (!/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(value) || value < min || value > max) {
-    throw new GrokConfigError(`invalid ${name} "${raw}". Use an integer from ${min} to ${max}.`);
-  }
-  return value;
-}
-
-function resolveCwd(raw: string | undefined, startupCwd: string): string {
-  if (!raw?.trim()) throw new GrokConfigError("GROK_CWD is required when SOURCE=grok.");
-  const requested = path.resolve(startupCwd, raw.trim());
-  let canonical: string;
-  try {
-    canonical = fs.realpathSync(requested);
-    if (!fs.statSync(canonical).isDirectory()) {
-      throw new GrokConfigError(`GROK_CWD is not a directory: ${requested}`);
-    }
-    fs.accessSync(canonical, fs.constants.R_OK | fs.constants.X_OK);
-  } catch (error) {
-    if (error instanceof GrokConfigError) throw error;
-    throw new GrokConfigError(`GROK_CWD is not an accessible directory: ${requested}`);
-  }
-  return canonical;
-}
-
-function resolveBin(raw: string | undefined, startupCwd: string): string {
-  const value = (raw ?? "grok").trim();
-  if (!value || value.includes("\0")) throw new GrokConfigError("GROK_BIN must name one executable.");
-  if (!value.includes("/")) return value;
-  const requested = path.resolve(startupCwd, value);
-  try {
-    const canonical = fs.realpathSync(requested);
-    if (!fs.statSync(canonical).isFile()) {
-      throw new GrokConfigError(`GROK_BIN is not a file: ${requested}`);
-    }
-    fs.accessSync(canonical, fs.constants.X_OK);
-    return canonical;
-  } catch (error) {
-    if (error instanceof GrokConfigError) throw error;
-    throw new GrokConfigError(`GROK_BIN is not executable: ${requested}`);
-  }
-}
-
-export function resolveGrokConfig(
-  env: NodeJS.ProcessEnv = process.env,
-  startupCwd: string = process.cwd(),
-): GrokConfig {
-  if (resolveSource(env) !== "grok") {
-    throw new GrokConfigError("Grok configuration requested while SOURCE is not grok.");
-  }
-  if (env.MUX?.trim()) {
-    throw new GrokConfigError("SOURCE=grok cannot be combined with MUX; unset MUX.");
-  }
-  const childEnv = { ...env };
-  delete childEnv.BRIDGE_TOKEN;
-  return {
-    cwd: resolveCwd(env.GROK_CWD, startupCwd),
-    bin: resolveBin(env.GROK_BIN, startupCwd),
-    startupTimeoutMs: integerSetting(env, "GROK_STARTUP_TIMEOUT_MS", 15_000, 1_000, 120_000),
-    cancelTimeoutMs: integerSetting(env, "GROK_CANCEL_TIMEOUT_MS", 5_000, 250, 60_000),
-    shutdownTimeoutMs: integerSetting(env, "GROK_SHUTDOWN_TIMEOUT_MS", 2_000, 250, 30_000),
-    env: childEnv,
-  };
-}
 
 export interface GrokVersion {
   major: number;

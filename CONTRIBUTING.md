@@ -4,14 +4,18 @@ Thanks for your interest in even-better.
 
 ## Development
 
-No build step — everything runs through [`tsx`](https://github.com/privatenumber/tsx).
+Development runs straight from source through
+[`tsx`](https://github.com/privatenumber/tsx) — no build needed to run, test, or
+simulate. `pnpm build` exists for packaging only: `bin` points at `dist/cli.js`,
+so an installed/published `even-better` is compiled output.
 
 ```bash
 pnpm install
 pnpm start        # run the server (prints a QR code)
-pnpm check        # tsc --noEmit — must pass before every commit
+pnpm check        # tsc over src/, scripts/, tools/ — must pass before every commit
 pnpm test         # run the unit suites in scripts/
-pnpm test:app-grok # deterministic fake-Grok server/app protocol coverage
+pnpm test:grok     # deterministic fake-Grok ACP coverage over the owned bridge
+pnpm test:app-owned # deterministic full-server owned-session wizard coverage
 ```
 
 Both `pnpm check` and `pnpm test` run in CI on every pull request.
@@ -39,5 +43,5 @@ Both `pnpm check` and `pnpm test` run in CI on every pull request.
 
 Conventional commits (`feat:` / `fix:` / `refactor:` / `docs:` / `chore:`).
 Keep a PR to one topic; make sure `pnpm check` and `pnpm test` pass first. Grok
-releases additionally require `pnpm test:app-grok` and the explicitly enabled
+releases additionally require `pnpm test:grok` and the explicitly enabled
 `GROK_SMOKE=1 pnpm smoke:grok` maintainer gate.

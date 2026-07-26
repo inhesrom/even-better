@@ -18,3 +18,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm test
+      # `bin` points at dist/cli.js and `prepack` runs build, so the shipped
+      # artifact path needs to compile in CI too.
+      - run: pnpm build

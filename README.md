@@ -67,15 +67,10 @@ even-better --source mux
 
 If both multiplexers are running, pick one with `MUX=herdr` or `MUX=cmux`.
 
-To launch one new Grok ACP session instead:
-
-```bash
-SOURCE=grok GROK_CWD="$PWD" even-better --source grok
-```
-
-Grok starts before the HTTP server. If its version, authentication, or working
-directory is invalid, even-better exits with an actionable error and prints no
-connection QR. See [docs/GROK.md](docs/GROK.md).
+To use Grok, launch normally and pick **Grok** when the new session asks for an
+agent — it runs as an owned agent like Claude and Codex. (The standalone
+`SOURCE=grok` source has been retired; it was a fork of the owned bridge over the
+same ACP child.) See [docs/GROK.md](docs/GROK.md).
 
 To replace the launch-directory default with multiple workspace roots:
 
@@ -91,8 +86,9 @@ wizard makes both real selections. See [docs/OWNED.md](docs/OWNED.md).
 
 - **Mux stays mirror-only.** The explicit mux source keeps existing Claude/Codex
   panes and token usage unchanged.
-- **Grok is explicit and owned.** `SOURCE=grok` launches one `grok agent stdio`
-  child and closes it when even-better shuts down. It never mirrors Grok's TUI.
+- **Grok is owned, never mirrored.** Choosing Grok launches one
+  `grok agent stdio` child that even-better closes on shutdown. It never mirrors
+  Grok's TUI.
 - **Owned sessions are durable.** The default source remembers each public ID,
   provider, directory, display history, and native resume ID. Provider and
   directory stay fixed for that session.
@@ -112,15 +108,14 @@ Everything is optional — `even-better` works with no flags.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `SOURCE` | `owned` in the CLI | Session source: per-session `owned` agents, existing `mux`, or one `grok` |
+| `SOURCE` | `owned` in the CLI | Session source: per-session `owned` agents, or existing `mux` panes |
 | `MUX` | auto | Multiplexer backend: `herdr` or `cmux`. Auto-detects; if both are present, prompts on a TTY (set this to choose) |
 | `WORKSPACE_ROOTS` | launch cwd | Platform-delimited approved absolute roots; explicit values replace the cwd default |
 | `EVEN_BETTER_HOME` | platform state directory | Override durable owned-session metadata/history storage |
 | `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped |
 | `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
 | `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |
-| `GROK_CWD` | – | Required with `SOURCE=grok`: accessible working directory for the new Grok session |
-| `GROK_BIN` | `grok` | Grok executable name or path |
+| `GROK_BIN` | `grok` | Grok executable name or path; missing executables are omitted from the owned wizard |
 | `OWNED_STARTUP_TIMEOUT_MS` | `15000` | Per-agent startup deadline in owned mode |
 | `OWNED_CANCEL_TIMEOUT_MS` | `5000` | Owned-session interruption deadline |
 | `OWNED_SHUTDOWN_TIMEOUT_MS` | `2000` | Per-stage owned child shutdown deadline |
@@ -134,6 +129,13 @@ Everything is optional — `even-better` works with no flags.
 | `BRIDGE_TOKEN` | ephemeral | Bearer token encoded into the QR. Unset means a fresh per-process token every launch |
 | `LOG` | `normal` | Logging mode: `off`, `normal`, `debug`, or `trace` |
 | `LOG_FILE` | `/tmp/even-better-<id>.events.log` | JSONL event log path |
+| `CONSOLE_LOG_FILE` | `/tmp/even-better-<id>.log` | Human-readable diagnostic tee (token-redacted) |
+| `INSTANCE_ID` | process id | Names the two log files so parallel launches do not collide |
+| `SHOW_TOKEN` | – | Print the bearer token unmasked in the startup banner |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config/transcript root, honored by the tailer and the hook installer alike |
+| `CODEX_HOME` | `~/.codex` | Codex config/rollout root |
+| `SELF_HOOK` | – | Route this server's own agent hook reports back to it (see docs/HOOK-MIGRATION.md) |
+| `EVEN_BETTER_HOOK_SOCKET` | platform state path | Override the hook endpoint socket path |
 | `QR` | `1` | Print a QR code. Set `0` to print only the URL |
 | `STREAM_TICK_MS` | `140` | Milliseconds between text-reveal frames on the glasses. Larger = text types out slower (easier to read before it scrolls); smaller = faster |
 

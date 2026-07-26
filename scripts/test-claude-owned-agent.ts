@@ -158,7 +158,12 @@ function fakeQueryFactory(): {
               requestId: "req-b",
             }),
           ]);
-          for (const decision of decisions) permissions.push(decision);
+          for (const decision of decisions) {
+            // A null decision means the SDK orphaned a batched request — the
+            // exact failure this test exists to catch.
+            assert.ok(decision, "every batched can_use_tool must resolve a decision");
+            permissions.push(decision);
+          }
           stream.push(result(true));
           continue;
         }
