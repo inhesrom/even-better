@@ -14,7 +14,14 @@ import {
   type PermissionDecision,
 } from "./grok-acp-process.js";
 import type { GrokConfig } from "./grok-config.js";
-import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo, OwnedQuestion, OwnedUsage } from "./owned-agent.js";
+import type {
+  OwnedAgent,
+  OwnedAgentSink,
+  OwnedAgentStartInfo,
+  OwnedCommand,
+  OwnedQuestion,
+  OwnedUsage,
+} from "./owned-agent.js";
 
 interface PendingPermission {
   id: string;
@@ -51,6 +58,7 @@ export class GrokOwnedAgent implements OwnedAgent {
   private unsubscribe: (() => void) | null = null;
   private permission: PendingPermission | null = null;
   private question: PendingQuestion | null = null;
+  private availableCommands: OwnedCommand[] = [];
   private previousUsage: TerminalUsage = { inputTokens: 0, outputTokens: 0, turns: 0 };
 
   constructor(config: GrokConfig) {
@@ -64,6 +72,10 @@ export class GrokOwnedAgent implements OwnedAgent {
     const info = await this.process.start(nativeSessionId);
     sink.event({ type: "model", model: info.model });
     return { nativeSessionId: info.sessionId, model: info.model };
+  }
+
+  commands(): OwnedCommand[] {
+    return this.availableCommands;
   }
 
   prompt(text: string): Promise<void> {
@@ -191,6 +203,11 @@ export class GrokOwnedAgent implements OwnedAgent {
         break;
       case "prose":
         this.sink.event({ type: "prose", text: update.text });
+        break;
+      case "commands":
+        // Grok re-advertises on change, so the latest notification is the whole list.
+        this.availableCommands = update.commands;
+        this.sink.event({ type: "commands", commands: this.availableCommands });
         break;
       case "unsupported_content":
         this.sink.event({

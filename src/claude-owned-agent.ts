@@ -7,8 +7,9 @@ import {
   type Query,
   type SDKMessage,
   type SDKUserMessage,
+  type SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo, OwnedQuestion } from "./owned-agent.js";
+import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo, OwnedCommand, OwnedQuestion } from "./owned-agent.js";
 import type { OwnedProviderConfig } from "./owned-config.js";
 
 type CanUseToolOptions = Parameters<CanUseTool>[2];
@@ -132,6 +133,18 @@ function normalizeQuestionAnswer(question: ClaudeQuestion, answer: string): stri
   return question.multiSelect ? labels : labels[0] ?? answer;
 }
 
+/** The SDK's SlashCommand is already our shape apart from an always-present, often
+ *  empty, argumentHint. Normalizing the empty string away keeps "does this take
+ *  arguments" a single presence check downstream. */
+function toOwnedCommands(commands: readonly SlashCommand[]): OwnedCommand[] {
+  return commands.map((command) => ({
+    name: command.name,
+    description: command.description,
+    ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+    ...(command.aliases?.length ? { aliases: command.aliases } : {}),
+  }));
+}
+
 function timeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), ms);
@@ -156,6 +169,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   private queryHandle: Query | null = null;
   private consumePromise: Promise<void> | null = null;
   private readonly interactions: PendingInteraction[] = [];
+  private availableCommands: OwnedCommand[] = [];
   private stderrTail = "";
   private active = false;
   private disposed = false;
@@ -190,11 +204,15 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     });
     this.consumePromise = this.consume();
     try {
-      await timeout(
+      const initialization = await timeout(
         this.queryHandle.initializationResult(),
         this.config.startupTimeoutMs,
         "Claude startup timed out. Check the Claude executable and authentication.",
       );
+      // The startup handshake already carries the command list — taking it from here
+      // keeps supportedCommands() (another control round trip) off the startup path.
+      this.availableCommands = toOwnedCommands(initialization.commands);
+      sink.event({ type: "commands", commands: this.availableCommands });
       // initializationResult() carries no active model; system/init reports it on turn one.
       return { nativeSessionId: sessionId, model: "" };
     } catch (error) {
@@ -202,6 +220,10 @@ export class ClaudeOwnedAgent implements OwnedAgent {
       const detail = this.stderrTail.trim();
       throw new Error(`Claude could not start. Run claude once to verify authentication. ${error instanceof Error ? error.message : String(error)}${detail ? ` ${detail}` : ""}`);
     }
+  }
+
+  commands(): OwnedCommand[] {
+    return this.availableCommands;
   }
 
   prompt(text: string): Promise<void> {
@@ -383,6 +405,31 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     if (message.type === "system" && message.subtype === "init") {
       // Arrives with turn one; the catalog persists it over the placeholder from start().
       this.sink.event({ type: "model", model: message.model });
+      return;
+    }
+    if (message.type === "system" && message.subtype === "commands_changed") {
+      // Skills are discovered as the agent works, so the list is not fixed at startup.
+      this.availableCommands = toOwnedCommands(message.commands);
+      this.sink.event({ type: "commands", commands: this.availableCommands });
+      return;
+    }
+    if (message.type === "system" && message.subtype === "local_command_output") {
+      // The only channel /usage, /cost and /context have — they bypass the query loop
+      // entirely, so dropping this makes those commands run and show nothing.
+      this.sink.event({ type: "prose", text: message.content });
+      return;
+    }
+    if (message.type === "system" && message.subtype === "compact_boundary") {
+      // /compact produces no prose of its own; without this it looks like nothing ran.
+      const before = message.compact_metadata.pre_tokens;
+      const after = message.compact_metadata.post_tokens;
+      this.sink.event({
+        type: "notification",
+        title: "Context compacted",
+        message: after === undefined
+          ? `Compacted ${before.toLocaleString()} tokens of context.`
+          : `Compacted ${before.toLocaleString()} tokens down to ${after.toLocaleString()}.`,
+      });
       return;
     }
     if (message.type === "assistant") {
