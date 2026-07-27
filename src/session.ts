@@ -4,7 +4,7 @@ export type SessionState = "idle" | "busy" | "awaiting";
 export class SessionControlError extends Error {
   constructor(
     message: string,
-    readonly status: 409 | 502 | 503,
+    readonly status: 404 | 409 | 502 | 503,
   ) {
     super(message);
     this.name = "SessionControlError";
@@ -55,5 +55,9 @@ export interface SessionCatalog {
   get(id: string): Promise<LiveSession | undefined>;
   default(): Promise<LiveSession | undefined>;
   info(): Promise<{ provider: ProviderId; model: string }>;
+  /** Optional capability: permanently remove a remembered session. Sources whose
+   *  sessions are not the server's to forget — mux panes belong to the
+   *  multiplexer — simply do not implement it. */
+  forget?(id: string): Promise<void>;
   dispose(): void | Promise<void>;
 }

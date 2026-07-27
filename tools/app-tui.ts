@@ -409,7 +409,7 @@ function pickerLines(width: number): string[] {
   })].forEach(
     (label, index) => lines.push(index === pick ? bold(`  ❯ ${label}`) : `    ${dim(label)}`),
   );
-  lines.push("", notice ? red(clip(notice, width)) : dim("↑↓ select · ⏎ open · q quit"));
+  lines.push("", notice ? red(clip(notice, width)) : dim("↑↓ select · ⏎ open · d delete · q quit"));
   return lines;
 }
 
@@ -523,6 +523,25 @@ async function openSession(): Promise<void> {
   void streamLoop();
 }
 
+/** DELETE /api/sessions/:id — not part of the stock protocol, so the glasses never
+ *  send it. It reaches the same catalog.forget() the 🗑 Manage sessions row uses,
+ *  which is the point: this drives that path without hardware. */
+async function deleteSession(): Promise<void> {
+  const row = rows[pick - 1];
+  if (!row) return;
+  const answer = await readLine(`delete "${row.title ?? row.id}"? [y/N] `);
+  if (answer.toLowerCase() !== "y") {
+    notice = "kept";
+    return;
+  }
+  const { status, body } = await api<{ error?: string }>(
+    `/sessions/${encodeURIComponent(row.id)}`,
+    { method: "DELETE" },
+  );
+  notice = status === 200 ? "deleted" : body.error ?? `delete failed (${status})`;
+  await loadSessions();
+}
+
 /** One read can carry several keystrokes, and an arrow is three bytes — so the
  *  chunk is split rather than treated as a single key. */
 function keysIn(chunk: string): string[] {
@@ -551,6 +570,7 @@ function onKey(chunk: string): void {
       if (up) pick = (pick - 1 + count) % count;
       else if (down) pick = (pick + 1) % count;
       else if (enter) void openSession();
+      else if (key === "d") void deleteSession();
     } else {
       const options = state.pending ? optionLabels(state.pending).length : 0;
       if (up && options) sel = (sel - 1 + options) % options;

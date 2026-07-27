@@ -56,6 +56,10 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   exists. The stock **＋ New Session** row's null-session prompt adopts that same
   row, survives the wizard, and runs after provider startup; a wizard finished
   with no prompt lands idle and asks for one.
+- **`owned-manage-session.ts` / `owned-row-question.ts`** — the second synthetic
+  row (**＋ Manage sessions**: pick → confirm → `catalog.forget`) and the prime +
+  deferral both synthetic rows need to get a menu rendered. That mechanism is one
+  measurement, not a preference, so it lives in one place rather than in each row.
 - **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
   and common owned bridge. Provider adapters own only their native protocol;
   the common bridge owns public IDs, pacing, interactions, and wire events.
@@ -195,14 +199,35 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   `:retry` question, so the wizard advances only on a deliberate tap. `SetupStep`
   is explicit for the same reason: with answers retained, the outstanding question
   can no longer be inferred from `selectedProvider === null`.
-- **The wizard's first question must not share a tick with the stream opening.**
-  The app silently drops it — no error, no retry, a blank row on the glasses. ADR
-  0004 measured that as "server-authored rows cannot host a menu" and reverted the
-  whole design; ADR 0005 isolated the real cause. `onConnect` emits a `user_prompt`
-  prime and `replayPending` defers the question by `SETUP_QUESTION_DELAY_MS`, on
-  every stream open including reconnects. Answers may emit their follow-up question
-  synchronously; only the first one after a stream opens needs the deferral.
-  `assertPrimedQuestion` in `test-owned-server.ts` is the guard.
+- **A synthetic row's first question must not share a tick with the stream
+  opening.** The app silently drops it — no error, no retry, a blank row on the
+  glasses. ADR 0004 measured that as "server-authored rows cannot host a menu" and
+  reverted the whole design; ADR 0005 isolated the real cause. `onConnect` emits a
+  `user_prompt` prime and `replayPending` defers the question by
+  `SETUP_QUESTION_DELAY_MS`, on every stream open including reconnects. Answers may
+  emit their follow-up question synchronously; only the first one after a stream
+  opens needs the deferral. Both halves live in `owned-row-question.ts` because the
+  wizard and the manage row both depend on them and neither can afford to drift.
+  `assertPrimedQuestion` in `test-owned-server.ts` is the guard for both.
+- **A question's option count is bounded, and the ceiling is unknown.** Eleven
+  options (ten sessions + Cancel) were silently not drawn on a physical phone;
+  four are fine. The signature is identical to the same-tick question above — no
+  error, nothing rejected, just a row stuck `awaiting` an answer to a menu that
+  does not exist, which reads on the glasses as thinking forever. Long menus must
+  page (`MANAGE_SESSION_LIMIT`), not grow. `WIZARD_DIRECTORY_LIMIT`'s `0` predates
+  this and is unverified for a workspace with many directories.
+- **Only ＋ (U+FF0B) and `·` are known to render in a row title.** 🗑 did not.
+  Titles are the one place an unrenderable glyph costs a whole feature, since the
+  row is how it is reached.
+- **Forgetting a session is dispose → drop from the map → `store.remove`.**
+  `store.remove()` refuses while `lease.json` exists and the catalog leases every
+  eligible row from construction, so the dispose has to come first. The map entry
+  goes before the store call, not after: by then the child is dead and the stream
+  ended, so a row left behind hands `get(id)` a gutted session. Every persisting
+  path (`save`, `onAssistant`, `prompt`) is gated on `disposed`, and `attachNow`
+  re-checks it — `store.save()`/`appendHistory()`/`acquireLease()` all call
+  `ensureSessionDirectory`, so a resume or a late `activity` hook racing the
+  delete would `mkdir` the directory straight back and resurrect the row.
 - **A pending setup is reused, never disposed.** `createSetup()` restarts the
   wizard in place on the same public id. Disposing it calls `dropSession`, which
   `res.end()`s the phone's SSE stream with no notification — so the second

@@ -17,9 +17,13 @@ export interface OwnedConfig {
   /** Options in the wizard's directory question; 0 means every eligible directory.
    *  An escape hatch: nobody has measured how long a menu the glasses render well. */
   directoryLimit: number;
-  /** How long after an SSE stream opens the wizard's first question is emitted.
-   *  Sending it in the same tick is dropped by the app — see SETUP_PRIME_TEXT in
-   *  owned-session-catalog.ts. 500ms was measured on a physical phone; a slower
+  /** Sessions per page in the manage row's delete question. Unlike
+   *  `directoryLimit` this has no "unlimited": eleven options did not render on a
+   *  physical phone, so the menu always pages. */
+  manageSessionLimit: number;
+  /** How long after an SSE stream opens a synthetic row's first question is
+   *  emitted. Sending it in the same tick is dropped by the app — see
+   *  owned-row-question.ts. 500ms was measured on a physical phone; a slower
    *  device may need more. */
   setupQuestionDelayMs: number;
   homeDir?: string;
@@ -135,6 +139,7 @@ export function resolveOwnedConfig(
   return {
     maxSessions: integerSetting(env, "MAX_OWNED_SESSIONS", 6, 1, 100),
     directoryLimit: integerSetting(env, "WIZARD_DIRECTORY_LIMIT", 0, 0, 200),
+    manageSessionLimit: integerSetting(env, "MANAGE_SESSION_LIMIT", 4, 1, 50),
     setupQuestionDelayMs: integerSetting(env, "SETUP_QUESTION_DELAY_MS", 500, 0, 5_000),
     homeDir: resolveEvenBetterHome(env, startupCwd),
     workspaces: new OwnedWorkspaceCatalog(roots),
