@@ -15,7 +15,7 @@ test("emit buffers with incrementing ids; getMessages(after) filters by id", () 
     all.map((m) => (m as { id: number }).id),
     [1, 2, 3],
   );
-  assert.equal((all[0] as { type: string }).type, "text_delta");
+  assert.equal((all[0] as { id: number; type?: string }).type, "text_delta");
   assert.deepEqual(
     getMessages(sid, 1).map((m) => (m as { id: number }).id),
     [2, 3], // only id > 1

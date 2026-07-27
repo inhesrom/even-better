@@ -7,9 +7,9 @@ about" at the end.
 
 ## What this system actually is
 
-One sentence: **it turns a live coding-agent-in-a-terminal into a
-provider-neutral event stream, and renders that stream onto a tiny remote
-display while relaying input back.**
+One sentence: **it turns a live coding-agent session—either mirrored from a
+terminal or owned through a provider adapter—into a provider-neutral event stream, and renders
+that stream onto a tiny remote display while relaying input back.**
 
 That sentence names the real center of the design — the *event stream*.
 Everything upstream of it exists to **produce** the stream; everything
@@ -25,6 +25,76 @@ seams belong only where a second real implementation is coming.
   └───────────────────┘ ◄─── └────────────────┘  ◄─── └──────────────────┘
      prompt / respond / interrupt          replay / status
 ```
+
+## Implemented runtime source boundary
+
+`SOURCE=owned` (the CLI default) and `SOURCE=mux` are selected once at launch.
+HTTP routes depend on the small `SessionCatalog` / `LiveSession` boundary in
+`src/session.ts`, rather than knowing how a session is produced.
+
+```text
+                       SessionCatalog / LiveSession
+                      ┌─────────────────────────────┐
+MuxSessionCatalog ───►│ list, get, default, prompt, │◄─── OwnedSessionCatalog
+  └─ PaneBridge       │ respond, interrupt, dispose │       └─ OwnedSessionBridge
+                      └──────────────┬──────────────┘          └─ OwnedAgent
+                                     │
+                              HTTP/SSE protocol
+```
+
+This boundary is intentionally narrower than the aspirational event-spine
+design below. It lets the owned implementation coexist with `PaneBridge` without
+refactoring the mature Claude/Codex transcript and multiplexer paths. The mux
+adapter delegates to the existing bridge manager.
+
+There was briefly a third catalog, `SOURCE=grok`, with its own
+`GrokSessionBridge`. It has been **retired**: that bridge was a fork of
+`OwnedSessionBridge` (81 byte-identical lines) wrapping the same
+`GrokAcpProcess` that owned mode already drives, so it added a parallel sink
+layer without adding capability. Grok is now one `OwnedAgent` among three. Read
+this as the standing rule — a second *implementation* earns a seam; a second
+*copy* does not.
+
+Owned mode's catalog, in more detail:
+
+```text
+OwnedSessionCatalog
+  ├─ default() creates a transient setup session from the first prompt
+  └─ remembered sessions (metadata + display history; lazily attached)
+       └─ OwnedSessionBridge (wire events, pacing, interaction state)
+            └─ OwnedAgent
+                 ├─ ClaudeOwnedAgent (Claude Agent SDK resume)
+                 ├─ CodexOwnedAgent  (app-server thread/resume)
+                 └─ GrokOwnedAgent   (ACP session/load or session/resume)
+```
+
+The stock app's voice-first **＋ New Session** row is outside the catalog and is
+the sole creation row. Its null-session first prompt makes `default()` create a
+transient setup session with a stable public ID. The wizard retains that prompt
+while it chooses a provider and directory. Successful setup starts and persists
+the native provider session, transforms the same public ID into a remembered
+session, and forwards the retained prompt through `OwnedSessionBridge` exactly
+once. Additional prompts targeting that ID are rejected while setup is
+unfinished; another *null-session* prompt restarts the wizard in place on the
+same ID, because disposing the pending setup would end the phone's SSE stream.
+
+`OwnedAgent` is deliberately source-neutral: adapters only own their native
+process/protocol and emit normalized prose, tool, plan, usage, interaction,
+status, and result events. The common bridge owns phone-facing IDs, output
+pacing, replayable interaction state, and result synthesis. `OwnedSessionCatalog`
+owns prompt-triggered setup, first-prompt retention, the workspace wizard,
+persistent store, attached-process cap, leases, and process lifetime. Each
+remembered session's agent provider and canonical cwd are immutable after setup.
+The phone-facing provider is always Codex in owned mode; `agentProvider` carries
+the real provider identity.
+
+The Grok producer is split into three concrete responsibilities:
+
+- `grok-acp-process.ts`: child ownership, ACP SDK transport, private IDs,
+  authentication, cancellation, and shutdown
+- `grok-acp-normalize.ts`: exhaustive ACP/Grok-extension normalization
+- `grok-bridge.ts`: even-terminal event ordering, interaction state, prose
+  pacing, tools, usage, and terminal result synthesis
 
 ## The spine: a provider-neutral event vocabulary
 
@@ -172,12 +242,12 @@ class Session {
 }
 ```
 
-Notice what left the core versus today's 800-line `PaneBridge`: dedup, volatile
+Notice what left the core versus today's ~1,100-line `PaneBridge`: dedup, volatile
 filtering, menu parsing, key grammar, herdr calls, wire formatting — every one
 of them now has a home on the producer or consumer side. The core is just the
 turn state machine.
 
-## Target module layout
+## Longer-term target module layout
 
 ```
 src/

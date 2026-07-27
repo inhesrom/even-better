@@ -319,21 +319,15 @@ export function startExpose(
   child.on("exit", (code) => {
     if (code && !found) console.error(`  ${provider.name} exited with code ${code}`);
   });
-  // Tear down on exit. The "exit" handler is the reliable path — the server's
-  // own SIGINT/SIGTERM handlers call process.exit() first, which pre-empts any
-  // signal handler registered here but still fires "exit".
+  // Tear down on exit only. index.ts owns SIGINT/SIGTERM and its shutdown() is
+  // async (it disposes the catalog, which reaps owned agent children). A signal
+  // handler here would call process.exit() synchronously and pre-empt that,
+  // orphaning every detached child and leaking their leases. "exit" still fires
+  // once index.ts's teardown finishes, which is all this needs.
   const teardown = (): void => {
     if (!child.killed) child.kill();
   };
   process.on("exit", teardown);
-  process.on("SIGINT", () => {
-    teardown();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    teardown();
-    process.exit(0);
-  });
 }
 
 function startTailscaleFunnel(port: number, buildAppUrl: (publicBase: string) => string, options: ExposeOptions): void {
@@ -420,13 +414,8 @@ function startTailscaleFunnel(port: number, buildAppUrl: (publicBase: string) =>
       /* best effort on shutdown */
     }
   };
+  // "exit" only — see the note in startExpose. A synchronous process.exit()
+  // here would pre-empt index.ts's async shutdown and orphan the owned agent
+  // children.
   process.on("exit", teardown);
-  process.on("SIGINT", () => {
-    teardown();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    teardown();
-    process.exit(0);
-  });
 }

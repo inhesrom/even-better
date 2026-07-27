@@ -4,6 +4,11 @@
 
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — runbooks for when the glasses
   show something wrong.
+- **[GROK.md](GROK.md)** — launch, lifecycle, security, limits, and verification
+  for Grok as an owned agent.
+- **[OWNED.md](OWNED.md)** — stock-launcher prompt-triggered setup, workspace
+  policy, persistence, resume, provider identity, and session-management
+  commands for the default source.
 
 **Working on even-better?** These are the contributor references:
 
@@ -17,6 +22,10 @@
   fields even-better depends on.
 - **[PERMISSIONS.md](PERMISSIONS.md)** — the permission/interaction flow (detect →
   present → respond) for both agents.
+- **[HOOK-MIGRATION.md](HOOK-MIGRATION.md)** — the self-installed agent hooks
+  (`SELF_HOOK`, `even-better hook-install`): design record and current state.
+- **[adr/](adr/)** — architecture decision records for the owned-session
+  launcher.
 
 (`AGENTS.md` at the repo root holds instructions for AI coding agents;
 `CLAUDE.md` is a symlink to it.)

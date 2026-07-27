@@ -1,37 +1,40 @@
 # even-better
 
-Mirror a terminal coding-agent session (Claude Code or Codex) onto **Even
-Realities G2** glasses. even-better speaks the same HTTP/SSE protocol as
-`@evenrealities/even-terminal`, so the stock Even App connects by scanning a QR
-code — but instead of spawning a new agent, it **mirrors an agent you're already
-running inside a terminal multiplexer** ([herdr](https://herdr.dev) or
-[cmux](https://github.com/manaflow-ai/cmux)). The terminal session and the
-glasses are the same process: what you see in the pane streams to the glasses,
-and prompts from the glasses are typed into the pane.
+Use a coding-agent session from **Even Realities G2** glasses. even-better
+speaks the same HTTP/SSE protocol as `@evenrealities/even-terminal`, so the
+stock Even App connects by scanning a QR code. Its default owned source lets
+each glasses session choose Claude, Codex, or Grok plus a working directory.
+Explicit sources can instead mirror Claude Code or Codex already running in
+[herdr](https://herdr.dev) or [cmux](https://github.com/manaflow-ai/cmux), or own
+one standalone Grok ACP session.
 
 ```
-┌── herdr / cmux ───────┐      ┌── even-better ─────────┐      ┌── Even App ──┐
-│ claude / codex panes  │◄────►│ HTTP + SSE             │◄────►│  → G2 glasses │
-│ (your live sessions)  │socket│ even-terminal protocol │ WiFi │              │
+┌── session source ─────┐      ┌── even-better ─────────┐      ┌── Even App ──┐
+│ mux panes / owned CLIs│◄────►│ HTTP + SSE             │◄────►│  → G2 glasses │
+│ Claude · Codex · Grok │ stdio│ even-terminal protocol │ WiFi │              │
 └───────────────────────┘      └────────────────────────┘      └──────────────┘
 ```
 
 > Unofficial project — not affiliated with or endorsed by Even Realities,
 > Anthropic, OpenAI, herdr, or cmux. The wire protocol is an independent,
-> interoperable implementation of what `@evenrealities/even-terminal` speaks;
-> agent output is read from the local session files Claude Code and Codex write on
-> your own machine. No code from those projects is included, and their formats are
-> used as observed and may change.
+> interoperable implementation of what `@evenrealities/even-terminal` speaks.
+> Owned sessions communicate with local agent CLIs through their supported SDK or
+> app-server protocols; mux sessions observe local Claude Code and Codex session
+> files. No code from those projects is included, and observed formats may change.
 
 ## Prerequisites
 
-- **macOS** (primary target), with one terminal multiplexer running and at least
-  one `claude` or `codex` agent live in a pane — even-better mirrors those; it
-  never spawns an agent itself. Either:
+- **Node.js ≥ 18** and **pnpm**.
+- For the mux source: **macOS** (primary target), with one terminal
+  multiplexer running and at least one `claude` or `codex` agent live in a pane:
   - **[herdr](https://herdr.dev)**, or
   - **[cmux](https://github.com/manaflow-ai/cmux)** (agent hooks must be
     installed — Claude Code is automatic, Codex needs `cmux hooks codex install`).
-- **Node.js ≥ 18** and **pnpm**.
+- For the Grok source: Grok CLI **0.2.103 or newer**, authenticated by
+  `XAI_API_KEY` or `grok login`. No multiplexer is used.
+- For the default multi-session owned source: one or more authenticated CLIs
+  installed: Claude Code, Codex CLI **0.142.5 or 0.145.0**, or Grok CLI
+  **0.2.103 or newer**.
 - **Even Realities G2** glasses paired with the **Even App** on your phone.
 - For remote access: the matching CLI (`tailscale`, `cloudflared`, `ngrok`,
   `bore`, or the built-in `ssh` for pinggy) — see [Remote access](#remote-access-off-your-wi-fi).
@@ -39,38 +42,86 @@ and prompts from the glasses are typed into the pane.
 ## Quick start
 
 ```bash
-pnpm install
-pnpm start          # prints a QR code — scan it with the Even App
+corepack pnpm install
+corepack pnpm build
+npm install -g .
+
+cd /path/to/workspace
+even-better          # prints a QR code — scan it with the Even App
 ```
 
-That's it — the glasses now show your live agent. Prompts you send from the
-glasses are typed into the pane; the agent's replies stream back.
+The launch directory is the default workspace root. The unchanged stock app
+supplies the sole **＋ New Session** row. Submit its first voice prompt and
+even-better opens the agent and directory wizard, retains that prompt during
+setup, then sends it automatically after the selected provider session starts
+and persists. Completed sessions remain in the list after server restarts and
+resume their native provider context when reopened.
 
-If both herdr and cmux are running, pick one with `MUX=herdr` or `MUX=cmux`.
+From a source checkout, `corepack pnpm start` provides the same default.
+
+To mirror existing herdr/cmux panes instead, run:
+
+```bash
+even-better --source mux
+```
+
+If both multiplexers are running, pick one with `MUX=herdr` or `MUX=cmux`.
+
+To use Grok, launch normally and pick **Grok** when the new session asks for an
+agent — it runs as an owned agent like Claude and Codex. (The standalone
+`SOURCE=grok` source has been retired; it was a fork of the owned bridge over the
+same ACP child.) See [docs/GROK.md](docs/GROK.md).
+
+To replace the launch-directory default with multiple workspace roots:
+
+```bash
+even-better --workspace-root /home/me/repos --workspace-root /home/me/work
+```
+
+Choose Codex in the phone's connection screen. The provider and directory
+fields sent by the app are compatibility values in this mode; the glasses
+wizard makes both real selections. See [docs/OWNED.md](docs/OWNED.md).
 
 ## What it does
 
-- **Mirrors, never spawns.** No extra agent process and no extra token spend
-  beyond what your terminal session already uses. Model, permission mode, and
-  everything else follow whatever the pane's agent is configured with.
-- **Lossless output.** It reads the agent's structured session transcript
-  (Claude/Codex jsonl) as the source of truth, so what reaches the glasses
-  matches the pane without screen-scraping guesswork. (Until that transcript is
-  available — a fresh agent before its session exists — it streams no content
-  yet, rather than scraping the screen.)
+- **Mux stays mirror-only.** The explicit mux source keeps existing Claude/Codex
+  panes and token usage unchanged.
+- **Grok is owned, never mirrored.** Choosing Grok launches one
+  `grok agent stdio` child that even-better closes on shutdown. It never mirrors
+  Grok's TUI.
+- **Owned sessions are durable.** The default source remembers each public ID,
+  provider, directory, display history, and native resume ID. Provider and
+  directory stay fixed for that session.
+- **Structured output.** Mux mode reads Claude/Codex session transcripts as its
+  source of truth; Grok mode consumes validated ACP frames. Neither coding-agent
+  path screen-scrapes prose. (A fresh mux agent streams no content until its
+  transcript exists.)
 - **Interactive.** Permission prompts and questions become menus on the glasses
-  you can answer; the answer is sent back into the pane. Prompts and interrupts
-  from the glasses drive the same pane.
+  you can answer. Prompts and interrupts drive the selected pane or owned Grok
+  session.
 
 For how this is built, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
-Everything is optional — `pnpm start` works with no flags.
+Everything is optional — `even-better` works with no flags.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
+| `SOURCE` | `owned` in the CLI | Session source: per-session `owned` agents, or existing `mux` panes |
 | `MUX` | auto | Multiplexer backend: `herdr` or `cmux`. Auto-detects; if both are present, prompts on a TTY (set this to choose) |
+| `WORKSPACE_ROOTS` | launch cwd | Platform-delimited approved absolute roots; explicit values replace the cwd default |
+| `EVEN_BETTER_HOME` | platform state directory | Override durable owned-session metadata/history storage |
+| `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped |
+| `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
+| `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |
+| `GROK_BIN` | `grok` | Grok executable name or path; missing executables are omitted from the owned wizard |
+| `OWNED_STARTUP_TIMEOUT_MS` | `30000` | Per-agent startup deadline in owned mode. A cold Claude/Codex start on a loaded machine can exceed 15s; Codex applies this budget per startup stage |
+| `OWNED_CANCEL_TIMEOUT_MS` | `5000` | Owned-session interruption deadline |
+| `OWNED_SHUTDOWN_TIMEOUT_MS` | `2000` | Per-stage owned child shutdown deadline |
+| `GROK_STARTUP_TIMEOUT_MS` | `15000` | Total deadline for version check, ACP initialization, authentication, and session creation |
+| `GROK_CANCEL_TIMEOUT_MS` | `5000` | How long interruption may take before the owned Grok process is terminated |
+| `GROK_SHUTDOWN_TIMEOUT_MS` | `2000` | Per-stage shutdown deadline before escalating from EOF to TERM to KILL |
 | `PORT` | `auto` | HTTP port. Unset/`auto`/`0` asks the OS for a free port; set a number only when you need a fixed one |
 | `BIND_HOST` | `auto` | Local bind/QR host: `auto`, `lan`, `local`, `tailscale`, or a literal IP. `PUBLIC_ACCESS` requires `auto` or loopback |
 | `PUBLIC_ACCESS` | `none` | Public access provider: `none`, `tailscale-funnel`, `pinggy`, `bore`, `ngrok`, `cloudflared` |
@@ -78,6 +129,14 @@ Everything is optional — `pnpm start` works with no flags.
 | `BRIDGE_TOKEN` | ephemeral | Bearer token encoded into the QR. Unset means a fresh per-process token every launch |
 | `LOG` | `normal` | Logging mode: `off`, `normal`, `debug`, or `trace` |
 | `LOG_FILE` | `/tmp/even-better-<id>.events.log` | JSONL event log path |
+| `CONSOLE_LOG_FILE` | `/tmp/even-better-<id>.log` | Human-readable diagnostic tee (token-redacted, consecutive duplicates collapsed) |
+| `LOG_MAX_BYTES` | `67108864` | Per-file cap for both logs. The earliest bytes are kept and one final notice is written; nothing rotates |
+| `INSTANCE_ID` | process id | Names the two log files so parallel launches do not collide |
+| `SHOW_TOKEN` | – | Print the bearer token unmasked in the startup banner |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config/transcript root, honored by the tailer and the hook installer alike |
+| `CODEX_HOME` | `~/.codex` | Codex config/rollout root |
+| `SELF_HOOK` | – | Route this server's own agent hook reports back to it (see docs/HOOK-MIGRATION.md) |
+| `EVEN_BETTER_HOOK_SOCKET` | platform state path | Override the hook endpoint socket path |
 | `QR` | `1` | Print a QR code. Set `0` to print only the URL |
 | `STREAM_TICK_MS` | `140` | Milliseconds between text-reveal frames on the glasses. Larger = text types out slower (easier to read before it scrolls); smaller = faster |
 
@@ -115,15 +174,32 @@ even-terminal-compatible endpoints under `/api`: `GET /events` (SSE) ·
 
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
+## Remembered-session commands
+
+```bash
+even-better sessions
+even-better sessions remove <public-id>
+even-better sessions clear
+```
+
+Removal forgets only even-better metadata and display history; the provider's
+native transcript remains intact. A running server leases its remembered rows,
+so stop that server before removing them.
+
 ## Caveats
 
 - Cost isn't computed (token counts are reported; `costUsd` is always 0).
+- The standalone Grok source is one fresh in-memory session per even-better
+  launch. It does not resume persisted sessions or run concurrent sessions.
+- Resume depends on the original provider's native transcript. A missing native
+  session produces an actionable notification while preserving the remembered
+  row and local display history.
 - A claude/codex pane shows content only from its structured transcript — a fresh
   agent shows nothing until its session's jsonl exists (no lossy screen scraping).
 - Permission menus are read from the screen; exotic prompts fall back to a
   "check your terminal" notification.
-- even-better only *mirrors* — it won't start a brand-new session from the
-  glasses; it picks the focused pane.
+- In mux mode, even-better only mirrors and picks the focused pane. In standalone
+  Grok mode, the single new session is the only session exposed to the glasses.
 
 ## Contributing
 

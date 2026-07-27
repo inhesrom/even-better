@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { claudeConfigDir } from "./agent-home.js";
 import type { AgentEvent, Timeline, Usage } from "./spine.js";
 import { JsonlTail } from "./jsonl-tail.js";
 
@@ -36,7 +36,7 @@ export function readClaudeModel(sessionId: string): string | undefined {
 // content source; the screen is only consulted for pending permission menus.
 
 export function findSessionFile(sessionId: string): string | null {
-  const root = join(homedir(), ".claude", "projects");
+  const root = join(claudeConfigDir(), "projects");
   if (!existsSync(root)) return null;
   for (const dir of readdirSync(root)) {
     const p = join(root, dir, `${sessionId}.jsonl`);

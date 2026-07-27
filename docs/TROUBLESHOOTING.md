@@ -25,6 +25,77 @@ field is derived from the herdr agent name (`codex` -> `codex`, everything else
 spawn or switch the real underlying agent; the bridge mirrors whichever herdr
 pane it targets.
 
+Grok has no separate source — it is one of the owned providers, so it shows the
+owned banner below and an `owned:<uuid>` session. There is no pane or transcript
+path for it: ACP stdout is the structured source. (`SOURCE=grok` was retired;
+setting it now fails with a message pointing at owned mode.)
+
+With the default owned source, the banner reports `Source : owned` and the app
+always connects as the Codex compatibility provider. `/api/sessions` returns
+remembered rows only; the stock app contributes the sole voice-first **＋ New
+Session** creation row. A Claude/Grok row still has `provider:"codex"`; inspect
+`agentProvider` or the title for the real agent.
+
+## Owned creation, persistence, and resume failures
+
+Before the first prompt, `GET /api/sessions` should contain remembered sessions
+only. Submitting a voice prompt from the stock **＋ New Session** row should
+return `202` with an `owned:` session ID. That ID appears temporarily as
+**Setting up agent session…**; connecting its SSE stream emits the agent
+question, and answering it emits the directory question.
+
+After directory selection, the same ID should become **Provider · folder ·
+prompt excerpt**. Persisted metadata and display history should contain the
+first prompt, and the event stream should contain one matching `user_prompt`
+followed by the provider turn. A second prompt targeting unfinished setup should
+return `409` so the retained prompt cannot be replaced or duplicated.
+
+If provider startup fails, the notification should be followed by a replayed
+setup question; the original prompt remains pending for the retry. Unfinished
+setup is transient and can be lost on server restart, while completed sessions
+remain durable.
+
+The launch cwd is the default workspace root. Explicit `--workspace-root`
+flags replace it, followed in precedence by `WORKSPACE_ROOTS`. An invalid
+directory message means the candidate does not exist, resolves outside every
+root (including through a symlink), or is ambiguous as a relative path. Enter
+an absolute existing descendant to disambiguate.
+
+Remembered metadata/history lives under the platform state directory or
+`EVEN_BETTER_HOME`. A row that survives restart but emits “could not resume” has
+kept its even-better data; verify the original provider CLI, authentication,
+native transcript, and exact cwd. Claude resumes its SDK session, Codex uses
+`thread/resume`, and Grok requires advertised `session/load` or
+`session/resume` support.
+
+`MAX_OWNED_SESSIONS` counts attached processes. An “all attached sessions are
+busy or awaiting input” error is not a catalog limit: finish, answer, or
+interrupt one protected session and retry. Idle processes are detached by LRU
+without forgetting their rows.
+
+`even-better sessions remove` and `clear` refuse leased rows while a server owns
+them. Stop that server first. These commands never delete native provider
+transcripts.
+
+## Grok startup and session failures
+
+Grok mode starts the owned agent before listening or printing a QR. If startup
+fails, work from the single error line:
+
+1. `Grok 0.2.103 or newer is required` — run `grok --version` and upgrade.
+2. `authentication is unavailable` — set `XAI_API_KEY` or run `grok login` in
+   the same user environment that launches even-better.
+3. `Working directory ...` — pick an existing readable/searchable directory
+   inside a workspace root (see `WORKSPACE_ROOTS` / `--workspace-root`).
+4. `timed out` — confirm `grok agent stdio` can start, then increase
+   `GROK_STARTUP_TIMEOUT_MS` only if startup is legitimately slow.
+
+During a live session, an unexpected exit or malformed/lost ACP connection
+emits one failed `result` if a turn is active and marks the session unavailable.
+Restart even-better; v1 does not silently create a replacement session. A
+permission or question remains pending until the glasses answer, interruption,
+or shutdown—there is no automatic allow/deny timeout.
+
 ## Transcript vs ScreenTimeline
 
 The bridge always prefers a structured transcript:
@@ -193,3 +264,19 @@ curl -sS \
 
 Inspect `/tmp/even-better-events.log` or `/tmp/even-better-sim.jsonl` for
 `user_prompt`, streamed text/tool events, `result`, and final idle status.
+
+For Grok, omit the pane simulator and drive the owned wizard directly:
+
+```bash
+PORT=3457 BRIDGE_TOKEN=test-token QR=0 pnpm start
+A=(-sS -H 'Authorization: Bearer test-token' -H 'content-type: application/json')
+# 1. first prompt with no sessionId creates the setup session
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/prompt -d '{"text":"say hi, no tools"}'
+# 2. answer the two setup questions with the returned sessionId
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/question-response -d '{"sessionId":"owned:…","answer":"Grok"}'
+curl "${A[@]}" -X POST http://127.0.0.1:3457/api/question-response -d '{"sessionId":"owned:…","answer":"'"$PWD"'"}'
+curl "${A[@]}" http://127.0.0.1:3457/api/sessions
+```
+
+The retained first prompt dispatches once setup completes. A prompt that
+explicitly requests no tools is the cheapest real-agent smoke check.

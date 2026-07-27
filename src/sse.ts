@@ -64,6 +64,25 @@ export function emit(sessionId: string, msg: object): void {
   }
 }
 
+/** Release a session's ring buffer once its bridge is gone. Nothing else prunes
+ *  `sessions`/`lastDisconnectAt`, so without this every pane that ever existed
+ *  keeps up to MAX_MESSAGES_PER_SESSION messages for the process lifetime. Any
+ *  still-attached client is dropped first — its session no longer produces. */
+export function dropSession(sessionId: string): void {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  for (const res of s.clients) {
+    try {
+      res.end();
+    } catch {
+      // Already dead; removing the buffer is the point.
+    }
+  }
+  s.clients.clear();
+  sessions.delete(sessionId);
+  lastDisconnectAt.delete(sessionId);
+}
+
 export function getMessages(
   sessionId: string,
   after: number,
