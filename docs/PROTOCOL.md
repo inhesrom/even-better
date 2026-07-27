@@ -213,10 +213,11 @@ questions, which carry `owned-question:`.
 A command question is emitted **inside a turn** — `user_prompt` and
 `status: busy` go first, exactly as for a provider question — and the turn stays
 open until the chosen command finishes, so one `result` closes the whole
-interaction. This is deliberate: ADR 0004 established that the app ignores a
-question the user's own prompt did not trigger, and a menu emitted with no turn
-in flight is the same untested shape. The answer is consumed by the bridge and
-never reaches the provider.
+interaction. This is deliberate, and it is the same requirement the wizard has:
+the stream must carry something turn-shaped before a `user_question` renders (ADR
+0005). A command question satisfies it for free, since `prompt()` already emits
+`user_prompt` and `status: busy` ahead of it. The answer is consumed by the
+bridge and never reaches the provider.
 
 ## Not wire types
 

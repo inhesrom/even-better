@@ -35,6 +35,13 @@ the app renders it once the stream first carries something turn-shaped. ADR
 Which of the prime and the delay is individually load-bearing was not isolated —
 variants 1–4 all shared the same-tick timing.
 
+Corroborating evidence arrived independently: the slash-command menus added in
+`98aca25` render reliably, and they are emitted inside the turn `prompt()` opened
+— which puts `user_prompt` and `status: busy` on the stream ahead of the
+question, and never in the same tick as a stream opening. That feature reached
+the same shape from the opposite direction, reasoning from ADR 0004's conclusion
+rather than around it.
+
 Separately, the directory question showed only four options
 (`workspaces.choices(4)`), mixing recently-used directories, the root, and its
 children — so launching in `~/repo` offered four things rather than the repos.

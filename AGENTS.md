@@ -228,8 +228,12 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   every exit must terminalize: Cancel is on every question, and `interrupt()`
   special-cases them because `agent.interrupt()` finds no active turn and returns
   a no-op, leaving the session busy with nothing running. Sitting inside the turn
-  is also what makes the menu wire-identical to a provider question — ADR 0004
-  established that the app ignores a question the user's prompt did not trigger.
+  is also what makes the menu render at all: it puts `user_prompt` + `status:
+  busy` on the stream ahead of the question, which is the same prime ADR 0005
+  measured the wizard needs. (ADR 0004 read this as "the app ignores a question
+  the user's prompt did not trigger"; ADR 0005 found the real constraint is that
+  the stream must first look like a turn and the question must not share a tick
+  with a stream opening. Both features land on the same shape either way.)
 - **Commands are enumerated, never invented.** `OwnedAgent.commands()` is an
   optional capability (like `Multiplexer.explain()`) and execution is passthrough
   — `prompt("/name args")`, which Claude and Grok parse themselves. Codex
