@@ -50,12 +50,14 @@ cd /path/to/workspace
 even-better          # prints a QR code — scan it with the Even App
 ```
 
-The launch directory is the default workspace root. The unchanged stock app
-supplies the sole **＋ New Session** row. Submit its first voice prompt and
-even-better opens the agent and directory wizard, retains that prompt during
-setup, then sends it automatically after the selected provider session starts
-and persists. Completed sessions remain in the list after server restarts and
-resume their native provider context when reopened.
+The launch directory is the default workspace root. Open the **＋ Agent setup**
+row and even-better asks which agent, then which directory — every eligible
+folder under the workspace roots, most recently used first. The session starts
+and goes idle with **Ready — say your prompt**; speak the task then. The stock
+app's own **＋ New Session** row still works prompt-first: its voice prompt is
+retained through the wizard and sent once the provider is up. Completed sessions
+remain in the list after server restarts and resume their native provider context
+when reopened.
 
 From a source checkout, `corepack pnpm start` provides the same default.
 
@@ -113,6 +115,8 @@ Everything is optional — `even-better` works with no flags.
 | `WORKSPACE_ROOTS` | launch cwd | Platform-delimited approved absolute roots; explicit values replace the cwd default |
 | `EVEN_BETTER_HOME` | platform state directory | Override durable owned-session metadata/history storage |
 | `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped |
+| `WIZARD_DIRECTORY_LIMIT` | `0` | Options in the wizard's directory question; `0` offers every eligible directory |
+| `SETUP_QUESTION_DELAY_MS` | `500` | Delay before the wizard's first question after a stream opens; the app drops one sent in the same tick (ADR 0005) |
 | `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
 | `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |
 | `GROK_BIN` | `grok` | Grok executable name or path; missing executables are omitted from the owned wizard |

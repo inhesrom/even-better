@@ -29,9 +29,21 @@ interface WireMessage {
   toolUseId?: string;
 }
 
-function assertNoAgentSetup(sessions: SessionItem[]): void {
-  assert.ok(sessions.every((session) => session.title !== "＋ Agent setup"));
+/** Exactly one wizard row is always offered so agent and directory can be chosen
+ *  before any prompt exists. Setup rows carry no `agentProvider`. */
+function assertOneWizardRow(sessions: SessionItem[], title?: string): void {
+  const wizard = sessions.filter((session) => session.agentProvider === undefined);
+  assert.equal(wizard.length, 1, `expected one wizard row, got ${JSON.stringify(sessions.map((s) => s.title))}`);
+  if (title !== undefined) assert.equal(wizard[0]?.title, title);
 }
+
+const agentRows = (sessions: SessionItem[]): SessionItem[] =>
+  sessions.filter((session) => session.agentProvider !== undefined);
+
+/** user_prompt texts minus the wizard's render prime (SETUP_PRIME_TEXT). */
+const promptTexts = (messages: WireMessage[]): Array<string | undefined> =>
+  messages.filter((message) => message.type === "user_prompt" && message.text !== "New agent session")
+    .map((message) => message.text);
 
 async function waitForServer(child: ChildProcess): Promise<string> {
   const stream = child.stdout;
@@ -85,6 +97,18 @@ async function waitForMessage(base: string, id: string, type: string, count = 1)
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Timed out waiting for ${type}`);
+}
+
+/** Wait for a real prompt. Counting `user_prompt` frames would be satisfied by the
+ *  wizard's render primes, which arrive on every stream open. */
+async function waitForTaskPrompt(base: string, id: string): Promise<WireMessage[]> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const body = await api<{ messages: WireMessage[] }>(base, `/messages?sessionId=${encodeURIComponent(id)}`);
+    if (promptTexts(body.messages).length > 0) return body.messages;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for a task prompt");
 }
 
 async function firstSseEvent(base: string, id: string): Promise<WireMessage> {
@@ -167,6 +191,24 @@ async function waitFor(what: string, ready: () => boolean): Promise<void> {
 const asked = (stream: OpenStream, step: string): number =>
   stream.events.filter((message) => message.toolUseId?.endsWith(`:${step}`)).length;
 
+/** ADR 0005: the wizard's first question must not arrive in the same frame as the
+ *  stream opening — the app silently drops it, which is what ADR 0004 measured and
+ *  mistook for "rows cannot host a menu". The prime goes first, the question follows. */
+async function assertPrimedQuestion(base: string, id: string): Promise<void> {
+  const stream = await openStream(base, id);
+  try {
+    await waitFor("the primed agent question", () => asked(stream, "provider") >= 1);
+    const types = stream.events.map((event) => event.type);
+    assert.equal(types[0], "user_prompt", `expected the prime first, got ${types.join(", ")}`);
+    assert.ok(
+      types.indexOf("user_question") > types.indexOf("user_prompt"),
+      `expected the question after the prime, got ${types.join(", ")}`,
+    );
+  } finally {
+    stream.close();
+  }
+}
+
 async function answer(base: string, sessionId: string, value: string): Promise<void> {
   await api(base, "/question-response", {
     method: "POST",
@@ -229,8 +271,10 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
     assert.equal((await api<{ provider: string }>(base, "/info")).provider, "codex");
 
     const initial = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
-    assert.deepEqual(initial.sessions, []);
-    assertNoAgentSetup(initial.sessions);
+    assert.deepEqual(agentRows(initial.sessions), []);
+    assertOneWizardRow(initial.sessions, "＋ Agent setup");
+    // Openable before anything is spoken: this is the reordering.
+    await assertPrimedQuestion(base, initial.sessions[0]!.id);
 
     const created = await api<{ sessionId: string; provider: string }>(base, "/prompt", {
       method: "POST",
@@ -240,7 +284,7 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
     assert.match(sessionId, /^owned:/);
     assert.equal(created.provider, "codex");
 
-    assert.equal((await firstSseEvent(base, sessionId)).type, "user_question");
+    await assertPrimedQuestion(base, sessionId);
     const premature = await api<{ error: string }>(base, "/prompt", {
       method: "POST",
       body: JSON.stringify({ sessionId, text: "must not be retained" }),
@@ -250,16 +294,26 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
     const settingUp = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
     assert.equal(settingUp.sessions.length, 1);
     assert.equal(settingUp.sessions[0]?.id, sessionId);
-    assert.equal(settingUp.sessions[0]?.title, "Setting up agent session…");
-    assertNoAgentSetup(settingUp.sessions);
+    // The ＋ New Session prompt takes over the wizard row rather than adding a second.
+    assertOneWizardRow(settingUp.sessions, "Setting up · first prompt");
     await api(base, "/question-response", {
       method: "POST",
       body: JSON.stringify({ sessionId, answer: "Grok" }),
     });
     await waitForMessage(base, sessionId, "user_question", 2);
-    const replayedDirectory = await firstSseEvent(base, sessionId);
-    assert.equal(replayedDirectory.type, "user_question");
-    assert.match(replayedDirectory.toolUseId ?? "", /:directory$/);
+    // A reconnect mid-wizard replays the outstanding question, primed the same way —
+    // the app needs the prime again on every stream, not just the first.
+    const reconnect = await openStream(base, sessionId);
+    try {
+      await waitFor("the replayed directory question", () => asked(reconnect, "directory") >= 1);
+      assert.equal(reconnect.events[0]?.type, "user_prompt");
+      assert.match(
+        reconnect.events.find((event) => event.type === "user_question")?.toolUseId ?? "",
+        /:directory$/,
+      );
+    } finally {
+      reconnect.close();
+    }
     await api(base, "/question-response", {
       method: "POST",
       body: JSON.stringify({ sessionId, answer: workspace }),
@@ -269,10 +323,11 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
     // open for the whole provider startup is what made the phone wait tens of seconds
     // with nothing on screen. Promotion lands in the background, with the first
     // prompt's user_prompt right behind it.
-    await waitForMessage(base, sessionId, "user_prompt");
+    await waitForTaskPrompt(base, sessionId);
     const configured = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
-    assert.equal(configured.sessions.length, 1);
-    assertNoAgentSetup(configured.sessions);
+    assert.equal(agentRows(configured.sessions).length, 1);
+    // Promotion frees the wizard slot, so a fresh way in is offered again.
+    assertOneWizardRow(configured.sessions, "＋ Agent setup");
     const remembered = configured.sessions.find((session) => session.id === sessionId);
     assert.equal(remembered?.provider, "codex");
     assert.equal(remembered?.agentProvider, "grok");
@@ -284,10 +339,7 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
 
     const pending = await waitForMessage(base, sessionId, "permission_request");
     assert.ok(pending.every((message) => !message.provider || message.provider === "codex"));
-    assert.deepEqual(
-      pending.filter((message) => message.type === "user_prompt").map((message) => message.text),
-      ["first prompt"],
-    );
+    assert.deepEqual(promptTexts(pending), ["first prompt"]);
     await api(base, "/permission-response", {
       method: "POST",
       body: JSON.stringify({ sessionId, decision: "allow" }),
@@ -308,15 +360,16 @@ test("the stock null-session prompt runs after owned setup and resumes with Code
       ],
     });
     const titled = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
-    assertNoAgentSetup(titled.sessions);
+    assertOneWizardRow(titled.sessions, "＋ Agent setup");
     assert.equal(titled.sessions.find((session) => session.id === sessionId)?.title, `Grok · ${path.basename(workspace)} · first prompt`);
 
     await stop(child);
     child = startServer(workspace, home);
     base = await waitForServer(child);
     const afterRestart = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
-    assert.equal(afterRestart.sessions.length, 1);
-    assertNoAgentSetup(afterRestart.sessions);
+    assert.equal(agentRows(afterRestart.sessions).length, 1);
+    // The wizard row is catalog state: minted fresh on restart, never persisted.
+    assertOneWizardRow(afterRestart.sessions, "＋ Agent setup");
     assert.equal(afterRestart.sessions.find((session) => session.id === sessionId)?.agentProvider, "grok");
     const status = await firstSseEvent(base, sessionId);
     assert.equal(status.type, "status");
@@ -354,16 +407,13 @@ test("a repeated ＋ New Session prompt reuses the session instead of closing it
     const listed = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
     assert.equal(listed.sessions.length, 1);
     assert.equal(listed.sessions[0]?.id, sessionId);
-    assertNoAgentSetup(listed.sessions);
+    assertOneWizardRow(listed.sessions, "Setting up · second attempt");
 
     // The restart retains the newest prompt, and the session still completes normally.
     await answer(base, sessionId, "Grok");
     await answer(base, sessionId, workspace);
-    await waitFor("the retained first prompt", () => stream.events.some((m) => m.type === "user_prompt"));
-    assert.deepEqual(
-      stream.events.filter((m) => m.type === "user_prompt").map((m) => m.text),
-      ["second attempt"],
-    );
+    await waitFor("the retained first prompt", () => promptTexts(stream.events).length > 0);
+    assert.deepEqual(promptTexts(stream.events), ["second attempt"]);
     assert.equal(stream.ended, false);
     stream.close();
   } finally {

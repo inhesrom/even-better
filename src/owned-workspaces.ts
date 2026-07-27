@@ -49,7 +49,10 @@ export class OwnedWorkspaceCatalog {
 
   constructor(readonly roots: string[]) {}
 
-  choices(limit = 4): string[] {
+  /** Every eligible directory, best first. Omitting `limit` returns all of them:
+   *  the wizard offers the whole list so launching in ~/repo shows every repo,
+   *  and a caller that must bound the menu passes an explicit cap. */
+  choices(limit?: number): string[] {
     const candidates = new Set<string>();
     for (const candidate of this.recent.keys()) {
       try {
@@ -71,7 +74,12 @@ export class OwnedWorkspaceCatalog {
         const requested = path.join(root, entry.name);
         try {
           const canonical = accessibleDirectory(requested, "Workspace");
-          if (this.approved(canonical)) candidates.add(canonical);
+          if (!this.approved(canonical)) continue;
+          // An uncapped menu should not be padded with .git and .even-better-state.
+          // Roots and remembered directories are always offered, and resolve()
+          // still accepts a dot directory typed or spoken as a path.
+          if (path.basename(canonical).startsWith(".") && !this.recent.has(canonical)) continue;
+          candidates.add(canonical);
         } catch {
           // Races, broken links, and inaccessible children are simply not offered.
         }
@@ -84,7 +92,7 @@ export class OwnedWorkspaceCatalog {
         modified: this.modifiedAt(candidate),
       }))
       .sort((a, b) => b.recent - a.recent || b.modified - a.modified || a.candidate.localeCompare(b.candidate))
-      .slice(0, Math.max(0, limit))
+      .slice(0, Math.max(0, limit ?? Number.POSITIVE_INFINITY))
       .map((entry) => entry.candidate);
   }
 

@@ -59,7 +59,7 @@ Owned mode's catalog, in more detail:
 
 ```text
 OwnedSessionCatalog
-  ├─ default() creates a transient setup session from the first prompt
+  ├─ one wizard row (＋ Agent setup; openable before any prompt exists)
   └─ remembered sessions (metadata + display history; lazily attached)
        └─ OwnedSessionBridge (wire events, pacing, interaction state)
             └─ OwnedAgent
@@ -68,21 +68,26 @@ OwnedSessionCatalog
                  └─ GrokOwnedAgent   (ACP session/load or session/resume)
 ```
 
-The stock app's voice-first **＋ New Session** row is outside the catalog and is
-the sole creation row. Its null-session first prompt makes `default()` create a
-transient setup session with a stable public ID. The wizard retains that prompt
-while it chooses a provider and directory. Successful setup starts and persists
-the native provider session, transforms the same public ID into a remembered
-session, and forwards the retained prompt through `OwnedSessionBridge` exactly
-once. Additional prompts targeting that ID are rejected while setup is
-unfinished; another *null-session* prompt restarts the wizard in place on the
-same ID, because disposing the pending setup would end the phone's SSE stream.
+`list()` keeps exactly one wizard row so the agent and directory questions are
+reachable before a prompt exists — the ordering the glasses actually want. Its
+stream is primed and its first question deferred, without which the app drops the
+menu (ADR 0005). Successful setup starts and persists the native provider session
+and transforms that same public ID into a remembered session; a retained prompt
+is forwarded through `OwnedSessionBridge` exactly once, and with none the session
+lands idle and asks for one.
+
+The stock app's voice-first **＋ New Session** row is outside the catalog. Its
+null-session prompt *adopts* the wizard row rather than creating a second, so
+that path stays prompt-first and loses nothing. Additional prompts targeting an
+unfinished wizard are rejected; another *null-session* prompt restarts it in
+place on the same ID, because disposing the pending setup would end the phone's
+SSE stream.
 
 `OwnedAgent` is deliberately source-neutral: adapters only own their native
 process/protocol and emit normalized prose, tool, plan, usage, interaction,
 status, and result events. The common bridge owns phone-facing IDs, output
 pacing, replayable interaction state, and result synthesis. `OwnedSessionCatalog`
-owns prompt-triggered setup, first-prompt retention, the workspace wizard,
+owns the wizard row, first-prompt retention, the workspace wizard,
 persistent store, attached-process cap, leases, and process lifetime. Each
 remembered session's agent provider and canonical cwd are immutable after setup.
 The phone-facing provider is always Codex in owned mode; `agentProvider` carries

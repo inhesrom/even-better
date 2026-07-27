@@ -51,9 +51,11 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   the permission/question interaction state machine.
 - **`session.ts` / `*-session-catalog.ts`** — source-neutral route boundary.
   Mux delegates to `PaneBridge`; Grok exposes exactly one live session; owned
-  mode lists durable, lazily attached sessions only. The stock **＋ New
-  Session** row is the sole launcher; its null-session first prompt creates a
-  transient setup session, survives the wizard, and runs after provider startup.
+  mode lists durable, lazily attached sessions plus exactly one wizard row
+  (**＋ Agent setup**), so agent and directory are chosen before any prompt
+  exists. The stock **＋ New Session** row's null-session prompt adopts that same
+  row, survives the wizard, and runs after provider startup; a wizard finished
+  with no prompt lands idle and asks for one.
 - **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
   and common owned bridge. Provider adapters own only their native protocol;
   the common bridge owns public IDs, pacing, interactions, and wire events.
@@ -193,6 +195,14 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   `:retry` question, so the wizard advances only on a deliberate tap. `SetupStep`
   is explicit for the same reason: with answers retained, the outstanding question
   can no longer be inferred from `selectedProvider === null`.
+- **The wizard's first question must not share a tick with the stream opening.**
+  The app silently drops it — no error, no retry, a blank row on the glasses. ADR
+  0004 measured that as "server-authored rows cannot host a menu" and reverted the
+  whole design; ADR 0005 isolated the real cause. `onConnect` emits a `user_prompt`
+  prime and `replayPending` defers the question by `SETUP_QUESTION_DELAY_MS`, on
+  every stream open including reconnects. Answers may emit their follow-up question
+  synchronously; only the first one after a stream opens needs the deferral.
+  `assertPrimedQuestion` in `test-owned-server.ts` is the guard.
 - **A pending setup is reused, never disposed.** `createSetup()` restarts the
   wizard in place on the same public id. Disposing it calls `dropSession`, which
   `res.end()`s the phone's SSE stream with no notification — so the second
@@ -218,8 +228,12 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   every exit must terminalize: Cancel is on every question, and `interrupt()`
   special-cases them because `agent.interrupt()` finds no active turn and returns
   a no-op, leaving the session busy with nothing running. Sitting inside the turn
-  is also what makes the menu wire-identical to a provider question — ADR 0004
-  established that the app ignores a question the user's prompt did not trigger.
+  is also what makes the menu render at all: it puts `user_prompt` + `status:
+  busy` on the stream ahead of the question, which is the same prime ADR 0005
+  measured the wizard needs. (ADR 0004 read this as "the app ignores a question
+  the user's prompt did not trigger"; ADR 0005 found the real constraint is that
+  the stream must first look like a turn and the question must not share a tick
+  with a stream opening. Both features land on the same shape either way.)
 - **Commands are enumerated, never invented.** `OwnedAgent.commands()` is an
   optional capability (like `Multiplexer.explain()`) and execution is passthrough
   — `prompt("/name args")`, which Claude and Grok parse themselves. Codex

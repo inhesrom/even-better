@@ -29,24 +29,41 @@ free text. even-better resolves filesystem real paths, never creates a requested
 directory, and rejects nonexistent paths, ambiguous relative paths, and symlink
 escapes.
 
-## Stock-launcher prompt-triggered setup
+## The setup wizard
 
-`/api/sessions` lists remembered sessions only. The unchanged stock app renders
-the sole **＋ New Session** row and opens its voice-first composer when selected;
-selection itself makes no server request. Submitting that first prompt sends
-`POST /api/prompt` with a null or missing `sessionId`. even-better creates a
-transient setup session, returns `202` with its stable public ID, and retains the
-prompt while its SSE stream asks:
+`/api/sessions` lists remembered sessions plus exactly **one** wizard row.
+Untouched it is titled **＋ Agent setup**. Opening it asks:
 
 1. Which installed agent to use.
 2. Which eligible directory to use.
 
-While setup is unfinished the transient row is titled **Setting up agent
-session…**. A second prompt targeting that ID returns `409`. Completing setup
-starts the selected provider session, persists its native resume ID and first
-prompt, appends the prompt to display history, turns the same public ID into a
-remembered session, and dispatches the retained prompt exactly once. Its title
-is immediately **Provider · folder · prompt excerpt**.
+Both questions come before any prompt exists — that is the point of the row.
+After startup the session lands idle with a **Ready — say your prompt**
+notification, and you speak the task into the live session. Its title is
+**Provider · folder** until that first prompt arrives, then **Provider · folder ·
+prompt excerpt**.
+
+The directory question lists **every** eligible directory, most-recently-used
+first, then by modification time, then by name. Dot-directories are excluded
+unless previously used; either way any absolute or unambiguous root-relative path
+can be spoken or typed instead. Set `WIZARD_DIRECTORY_LIMIT` (default `0` =
+unlimited) if a long menu renders badly on the glasses.
+
+Opening the row emits a `user_prompt` prime, then the question after
+`SETUP_QUESTION_DELAY_MS` (default 500). This is not cosmetic: **a question sent
+in the same tick as the stream opening is silently dropped by the app.** ADR 0005
+records the measurement, including the four shapes that do not work. Raise the
+delay if a slower phone misses the menu.
+
+The unchanged stock app also renders its own **＋ New Session** row, whose
+voice-first composer sends `POST /api/prompt` with a null or missing `sessionId`.
+That prompt **adopts the wizard row** rather than adding a second one, retitling
+it **Setting up · excerpt**, and is dispatched exactly once after startup —
+nothing is discarded. A second prompt to an unfinished wizard returns `409`.
+
+Only a setup that has begun starting a provider frees the slot, so exactly one
+way in is offered at a time; while a provider boots its row reads **Starting
+Agent · folder…** and a fresh **＋ Agent setup** appears beside it.
 
 If provider startup fails, even-better keeps the transient session, the original
 prompt, **and both answers**, then asks a single retry question — **Retry**,
@@ -56,10 +73,11 @@ the glasses through the whole wizard on every attempt, with no way out. Repeated
 failures carry an `(attempt N)` count. Retrying setup does not duplicate the
 prompt.
 
-Because the ＋ row is voice-first, a re-tap arrives as another null-session
-prompt. That **restarts the wizard on the same public ID** and keeps the phone's
-SSE stream; the newest prompt is the one retained. Transient setup is
-intentionally not durable across a server restart.
+Because the ＋ New Session row is voice-first, a re-tap arrives as another
+null-session prompt. That **restarts the wizard on the same public ID** and keeps
+the phone's SSE stream; the newest prompt is the one retained. The wizard row is
+catalog state: it is never written to disk and is minted fresh after a restart,
+so an unfinished setup and its retained prompt do not survive one.
 
 The phone's creation `provider` and `cwd` fields are compatibility inputs and
 are ignored. The glasses wizard is authoritative, and the chosen agent provider
