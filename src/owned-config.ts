@@ -105,7 +105,9 @@ export function resolveOwnedConfig(
   }
   const childEnv = { ...env };
   delete childEnv.BRIDGE_TOKEN;
-  const startupTimeoutMs = integerSetting(env, "OWNED_STARTUP_TIMEOUT_MS", 15_000, 1_000, 120_000);
+  // 15s was not enough headroom: the Claude Agent SDK cold start missed it four
+  // times in a row on a loaded machine, failing session creation outright.
+  const startupTimeoutMs = integerSetting(env, "OWNED_STARTUP_TIMEOUT_MS", 30_000, 1_000, 120_000);
   const cancelTimeoutMs = integerSetting(env, "OWNED_CANCEL_TIMEOUT_MS", 5_000, 250, 60_000);
   const shutdownTimeoutMs = integerSetting(env, "OWNED_SHUTDOWN_TIMEOUT_MS", 2_000, 250, 30_000);
   const providers: Partial<Record<ProviderId, OwnedProviderConfig>> = {};

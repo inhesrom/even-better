@@ -121,14 +121,31 @@ async function setup(
   const id = session.id;
   await session.respondQuestion(provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : "Grok");
   await session.respondQuestion(project);
-  await settle();
+  await settle(() => session.agentProvider !== undefined);
   assert.equal(session.id, id);
   return session;
 }
 
-async function settle(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 20));
+/** Wait for the catalog to reach `ready`. The wizard dispatches its launch without
+ *  awaiting it (so the phone's POST returns immediately), so a fixed sleep would race a
+ *  whole provider attach — lease, factory, start — on a loaded machine. */
+async function settle(ready: () => boolean = () => true): Promise<void> {
+  const deadline = Date.now() + 4_000;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    if (ready()) return;
+    if (Date.now() > deadline) throw new Error("Timed out waiting for the catalog to settle");
+  }
 }
+
+/** How many wizard questions of `step` this session has emitted. */
+const asked = (session: LiveSession, step: string): number =>
+  getMessages(session.id, 0).filter((message) =>
+    (message as { toolUseId?: string }).toolUseId?.endsWith(`:${step}`),
+  ).length;
+
+const notified = (session: LiveSession, title: string): boolean =>
+  getMessages(session.id, 0).some((message) => (message as { title?: string }).title === title);
 
 test("the first null-session prompt creates a replayable setup session", async () => {
   const home = path.join(scratch, "state-prompt-setup");
@@ -158,14 +175,16 @@ test("the first null-session prompt creates a replayable setup session", async (
   }
 });
 
-test("abandoned setup sessions do not accumulate", async () => {
+test("a restarted setup reuses its public id instead of dropping the phone's stream", async () => {
   const home = path.join(scratch, "state-setup-eviction");
   const agents: FakeAgent[] = [];
   const catalog = new OwnedSessionCatalog(config(home), factory(agents));
   try {
-    // Every null-session prompt used to mint a permanent map entry — nothing
-    // ever removed one — and setups sort first in list(), so the phone's list
-    // filled with "Setting up agent session…" rows.
+    // Every null-session prompt used to mint a permanent map entry, and setups sort
+    // first in list(), so the phone's list filled with "Setting up agent session…"
+    // rows. Disposing the previous one instead ended its SSE stream with no
+    // notification, which killed the wizard the phone had open whenever a prompt
+    // arrived twice. Reusing the pending setup does both jobs.
     const ids: string[] = [];
     for (let attempt = 0; attempt < 5; attempt++) {
       const session = await beginSetup(catalog, `abandoned ${attempt}`);
@@ -174,11 +193,20 @@ test("abandoned setup sessions do not accumulate", async () => {
     const listed = await catalog.list();
     assert.equal(listed.length, 1, `expected one setup row, got ${JSON.stringify(listed.map((s) => s.title))}`);
     assert.equal(listed[0]?.title, "Setting up agent session…");
-    // Only the newest survives; the abandoned ones are gone from the catalog.
-    assert.equal(listed[0]?.id, ids[ids.length - 1]);
-    for (const id of ids.slice(0, -1)) assert.equal(await catalog.get(id), undefined);
+    // One stable public id across every restart, still resolvable — the app keeps its
+    // stream and its id rather than being left on a dead one.
+    assert.equal(new Set(ids).size, 1);
+    assert.equal(listed[0]?.id, ids[0]);
+    assert.ok(await catalog.get(ids[0]!));
+    // Each restart re-asks the agent question rather than leaving a stale menu.
+    assert.equal(
+      getMessages(ids[0]!, 0).filter((message) =>
+        (message as { toolUseId?: string }).toolUseId?.endsWith(":provider"),
+      ).length,
+      4,
+    );
 
-    // A completed setup is a remembered session and is never evicted this way.
+    // A completed setup is a remembered session and is never reused this way.
     const live = await setup(catalog, "codex", "keep me");
     await beginSetup(catalog, "another abandoned");
     const after = await catalog.list();
@@ -201,7 +229,7 @@ test("successful setup persists and dispatches the retained first prompt once", 
 
     await session.respondQuestion("Claude");
     await session.respondQuestion(project);
-    await settle();
+    await settle(() => session.agentProvider !== undefined);
 
     assert.equal(session.id, publicId);
     assert.equal(session.agentProvider, "claude");
@@ -238,15 +266,20 @@ test("provider startup failure reopens setup with the first prompt retained", as
 
     await session.respondQuestion("Claude");
     await session.respondQuestion(project);
+    await settle(() => asked(session, "retry") >= 1);
     assert.equal(session.agentProvider, undefined);
     assert.equal((await session.describe()).title, "Setting up agent session…");
+    assert.ok(notified(session, "Claude could not start"));
+    // A failed start reopens as a one-tap retry that keeps both answers. Walking the
+    // glasses back through the agent and directory questions is what looped the
+    // wizard forever whenever a provider kept timing out.
     assert.ok(getMessages(session.id, 0).some((message) =>
-      (message as { title?: string }).title === "Claude could not start",
+      (message as { type?: string }).type === "user_question"
+      && (message as { toolUseId?: string }).toolUseId?.endsWith(":retry"),
     ));
 
-    await session.respondQuestion("Claude");
-    await session.respondQuestion(project);
-    await settle();
+    await session.respondQuestion("Retry");
+    await settle(() => session.agentProvider !== undefined);
 
     assert.deepEqual(agents[0]?.prompts, []);
     assert.deepEqual(agents[1]?.prompts, ["keep this exact prompt"]);
@@ -255,6 +288,67 @@ test("provider startup failure reopens setup with the first prompt retained", as
       { role: "user", text: "keep this exact prompt" },
       { role: "assistant", text: "reply to keep this exact prompt" },
     ]);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the retry menu keeps both answers and never reopens the whole wizard", async () => {
+  const home = path.join(scratch, "state-retry-menu");
+  const agents: FakeAgent[] = [];
+  // Every start fails, which is exactly the observed incident: a provider that kept
+  // timing out walked the glasses through agent + directory on every attempt, four
+  // full cycles in two minutes, with no way out.
+  const catalog = new OwnedSessionCatalog(config(home), (provider, cwd) => {
+    const agent = new FakeAgent(provider, cwd, agents.length, false, true);
+    agents.push(agent);
+    return agent;
+  });
+  try {
+    const session = await catalog.default();
+    assert.ok(session);
+    await session.prompt("retry me");
+    await session.respondQuestion("Claude");
+    await session.respondQuestion(project);
+    await settle(() => asked(session, "retry") >= 1);
+    assert.equal(asked(session, "retry"), 1);
+    assert.equal(asked(session, "provider"), 0);
+    assert.equal(asked(session, "directory"), 1);
+
+    // Retry re-runs the same agent in the same directory without re-asking either.
+    await session.respondQuestion("Retry");
+    await settle(() => asked(session, "retry") >= 2);
+    assert.equal(agents.length, 2);
+    assert.equal(agents[1]?.provider, "claude");
+    assert.equal(agents[1]?.cwd, fs.realpathSync(project));
+    assert.equal(asked(session, "retry"), 2);
+    assert.equal(asked(session, "provider"), 0);
+    assert.equal(asked(session, "directory"), 1);
+    // Repeated failure is visible rather than silent.
+    assert.ok(getMessages(session.id, 0).some((message) =>
+      (message as { message?: string }).message?.includes("(attempt 2)"),
+    ));
+
+    // Change directory reopens only the directory question.
+    await session.respondQuestion("Change directory");
+    assert.equal(asked(session, "directory"), 2);
+    assert.equal(asked(session, "provider"), 0);
+    await session.respondQuestion(project);
+    await settle(() => asked(session, "retry") >= 3);
+    assert.equal(asked(session, "retry"), 3);
+
+    // Change agent is the only route back to the agent question.
+    await session.respondQuestion("Change agent");
+    assert.equal(asked(session, "provider"), 1);
+
+    // The retained first prompt survives every failure, and nothing was persisted.
+    await session.respondQuestion("Codex");
+    await session.respondQuestion(project);
+    await settle(() => asked(session, "retry") >= 4);
+    assert.equal(agents.at(-1)?.provider, "codex");
+    assert.equal(session.agentProvider, undefined);
+    assert.equal((await session.describe()).title, "Setting up agent session…");
+    assert.equal(catalog.store.get(session.id), undefined);
   } finally {
     await catalog.dispose();
   }
@@ -297,7 +391,7 @@ test("restart lists remembered sessions only and lazily resumes their native con
     await remembered.onConnect?.();
     assert.deepEqual(resumedAgents[0]?.resumes, ["native-claude-0"]);
     await remembered.prompt("continued");
-    await settle();
+    await settle(() => getMessages(remembered.id, 0).some((m) => (m as { type?: string }).type === "result"));
     assert.equal((await remembered.history?.())?.at(-1)?.text, "reply to continued");
   } finally {
     await restored.dispose();
@@ -320,6 +414,7 @@ test("MAX_OWNED_SESSIONS caps attached processes and evicts only idle LRU sessio
     const third = await beginSetup(catalog, "start codex");
     await third.respondQuestion("Codex");
     await third.respondQuestion(project);
+    await settle(() => asked(third, "retry") >= 1);
     assert.equal(third.agentProvider, undefined);
     assert.equal(first.state, "busy");
     assert.equal(agents[2]?.disposed, 0);
@@ -327,18 +422,60 @@ test("MAX_OWNED_SESSIONS caps attached processes and evicts only idle LRU sessio
     assert.equal(afterFailedSetup.filter((session) => session.title === "Setting up agent session…").length, 1);
     assert.ok(afterFailedSetup.every((session) => session.title !== "＋ Agent setup"));
     assert.equal(afterFailedSetup[0]?.id, third.id);
-    assert.ok(getMessages(third.id, 0).some((message) => (message as { title?: string }).title === "Agent process limit reached"));
+    assert.ok(notified(third, "Agent process limit reached"));
 
     await first.interrupt();
-    await settle();
+    await settle(() => first.state === "idle");
     await first.prompt("await");
     assert.equal(first.state, "awaiting");
-    await third.respondQuestion(project);
+    await third.respondQuestion("Retry");
+    await settle(() => asked(third, "retry") >= 2);
     assert.equal(third.agentProvider, undefined);
     assert.equal(agents[2]?.disposed, 0);
   } finally {
     await catalog.dispose();
   }
+});
+
+// A bridge is installed only once start() resolves, so a teardown landing mid-spawn used
+// to find nothing to dispose: the child (detached for codex and grok) outlived the
+// server, the session promoted onto a disposed object, and metadata landed after
+// shutdown. The probe for this never exited — the bridge's stats interval kept firing.
+test("shutdown during a spawning provider disposes the child and does not promote", async () => {
+  const home = path.join(scratch, "state-dispose-race");
+  let spawning = false;
+  let release = (): void => {};
+  let disposed = 0;
+  class SlowStart implements OwnedAgent {
+    readonly provider = "claude" as const;
+    constructor(readonly cwd: string) {}
+    start(): Promise<OwnedAgentStartInfo> {
+      spawning = true;
+      return new Promise((resolve) => {
+        release = () => resolve({ nativeSessionId: "native-slow", model: "fake-claude" });
+      });
+    }
+    prompt(): Promise<void> { return Promise.resolve(); }
+    respondPermission(): Promise<void> { return Promise.resolve(); }
+    respondQuestion(): Promise<void> { return Promise.resolve(); }
+    interrupt(): Promise<void> { return Promise.resolve(); }
+    dispose(): Promise<void> { disposed += 1; return Promise.resolve(); }
+  }
+  const catalog = new OwnedSessionCatalog(config(home), (_provider, cwd) => new SlowStart(cwd));
+  const session = await beginSetup(catalog, "work that never starts");
+  await session.respondQuestion("Claude");
+  await session.respondQuestion(project);
+  await settle(() => spawning);
+  assert.equal(disposed, 0);
+
+  await catalog.dispose();
+  assert.equal(disposed, 1, "the spawning child must be disposed by shutdown");
+
+  release();
+  await settle(() => true);
+  assert.equal(disposed, 1);
+  assert.equal(session.agentProvider, undefined, "a disposed session must not promote");
+  assert.equal(catalog.store.get(session.id), undefined, "no metadata may be written after shutdown");
 });
 
 test("resume failures keep remembered metadata and local history", async () => {
