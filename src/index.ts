@@ -690,14 +690,57 @@ function onSignal(code: number): void {
 }
 process.on("SIGINT", () => onSignal(0));
 process.on("SIGTERM", () => onSignal(0));
+
+// A dead terminal is not a reason to lose live agent sessions: a closed/severed
+// stdio pipe surfaces as one of these codes, thrown synchronously on write or
+// emitted as 'error' on the stream. Everything else keeps the shutdown policy.
+const STDIO_DEATH_CODES = new Set(["EPIPE", "EIO", "ERR_STREAM_DESTROYED"]);
+function isStdioDeath(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const code = (value as { code?: unknown }).code;
+  return typeof code === "string" && STDIO_DEATH_CODES.has(code);
+}
+// Logging a fatal can itself throw (that is how a broken stdout turned one EPIPE
+// into millions of re-entries); drop the nested fatal instead of re-processing it.
+let handlingFatal = false;
+function safeLog(message: string): void {
+  try {
+    console.error(message);
+  } catch {
+    // The console is gone — the process still serves the phone.
+  }
+}
+function onFatal(label: string, value: unknown, detail: string): void {
+  if (handlingFatal) return;
+  handlingFatal = true;
+  try {
+    safeLog(`[bridge] ${label}: ${detail}`);
+    if (isStdioDeath(value)) return;
+    if (sourceMode !== "mux") shutdown(1);
+  } finally {
+    handlingFatal = false;
+  }
+}
 process.on("uncaughtException", (err) => {
-  console.error(`[bridge] uncaught: ${err.message}\n${err.stack}`);
-  if (sourceMode !== "mux") shutdown(1);
+  onFatal("uncaught", err, `${err.message}\n${err.stack}`);
 });
 process.on("unhandledRejection", (reason) => {
-  console.error(`[bridge] unhandled rejection: ${String(reason)}`);
-  if (sourceMode !== "mux") shutdown(1);
+  onFatal("unhandled rejection", reason, String(reason));
 });
+// Async writes report failure by emitting 'error' rather than throwing; without a
+// listener that becomes an uncaught exception. Only stdio death is swallowed —
+// any other write error is still surfaced through the fatal path.
+for (const stream of [process.stdout, process.stderr]) {
+  // One report per stream: reporting a stream's own failure writes to a stream
+  // that can fail the same way, and these emissions are async, so the re-entrancy
+  // guard above would not catch the ping-pong.
+  let reported = false;
+  stream.on("error", (err: NodeJS.ErrnoException) => {
+    if (isStdioDeath(err) || reported) return;
+    reported = true;
+    onFatal("stdio error", err, err.message);
+  });
+}
 
 // Re-export for potential programmatic use / tests.
 export { emit };

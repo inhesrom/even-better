@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, statSync } from "node:fs";
 
 export type LogMode = "off" | "normal" | "debug" | "trace";
 
@@ -29,11 +29,104 @@ export const logsVerboseSse = logMode === "trace";
 export const consoleLogPath =
   process.env.CONSOLE_LOG_FILE ?? `/tmp/even-better-${process.env.INSTANCE_ID ?? process.pid}.log`;
 
-/** Tee console.{log,info,warn,error} to `consoleLogPath` (timestamped + token-redacted).
- *  Call once at startup, before the banner, so everything shown is captured. Off with
- *  LOG=off. Best-effort — a file error never breaks a console call. */
+const DEFAULT_LOG_MAX_BYTES = 64 * 1024 * 1024;
+
+function resolveLogMaxBytes(): number {
+  const raw = process.env.LOG_MAX_BYTES;
+  if (raw === undefined) return DEFAULT_LOG_MAX_BYTES;
+  const bytes = Number(raw.trim());
+  return Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : DEFAULT_LOG_MAX_BYTES;
+}
+
+/** Per-file byte budget for this process's log output (`LOG_MAX_BYTES`). */
+export const logMaxBytes = resolveLogMaxBytes();
+
+/** Append whole lines to `filePath` until this process has written `maxBytes`, then write
+ *  one cap notice and drop everything after. The EARLIEST bytes are the ones kept, on
+ *  purpose: a runaway loop is diagnosed from the boot banner and the first stack trace, so
+ *  this must never rotate or keep the tail. Best effort — fs errors are swallowed, exactly
+ *  like the direct appends this replaced. */
+export function cappedAppender(
+  filePath: string,
+  maxBytes: number = logMaxBytes,
+  // The notice has to speak the file's own format: the event log is consumed with `jq`
+  // (docs/TROUBLESHOOTING.md), so a prose line there would abort the reader.
+  capNotice: (maxBytes: number) => string = (bytes) => `… log capped at ${bytes} bytes; further lines dropped`,
+): (line: string) => void {
+  // Seeded from what is already on disk so the cap bounds the FILE, not one process:
+  // the default paths carry a pid, but `LOG_FILE`/`INSTANCE_ID` pin a stable path, and a
+  // crash-looping server would otherwise re-earn the whole budget on every restart.
+  let written = ((): number => {
+    try {
+      return statSync(filePath).size;
+    } catch {
+      return 0; // not created yet
+    }
+  })();
+  let capped = false;
+  return (line: string): void => {
+    if (capped) return;
+    const text = `${line}\n`;
+    const bytes = Buffer.byteLength(text); // UTF-8 length: the file grows in bytes, not code units
+    const over = written + bytes > maxBytes;
+    try {
+      appendFileSync(filePath, over ? `${capNotice(maxBytes)}\n` : text);
+      // Latch only on a write that landed, so one transient fs error cannot silence
+      // the rest of the log.
+      if (over) capped = true;
+      else written += bytes;
+    } catch {
+      // best effort — never let logging break its caller
+    }
+  };
+}
+
+/** Repeats are reported at least this often, so a hot loop is visible in the log while it
+ *  is still running instead of only once it stops. 5M repeats cost 5000 lines. */
+const REPEAT_FLUSH_EVERY = 1_000;
+
+/** Collapse consecutive identical messages into one repeat line. A hot loop (an EPIPE
+ *  storm re-entering index.ts's uncaughtException handler) otherwise writes the same
+ *  line millions of times. Console tee only — the event log stays one JSON object per
+ *  line. Compares the message, not the emitted line, whose timestamp is always new. */
+function dedupingWriter(append: (line: string) => void): {
+  write: (tag: string, message: string) => void;
+  flush: () => void;
+} {
+  let last: { tag: string; message: string } | null = null;
+  let repeats = 0;
+  const flush = (): void => {
+    if (last === null || repeats === 0) return;
+    append(`${new Date().toISOString()} ${last.tag} (previous line repeated ${repeats} times)`);
+    repeats = 0;
+  };
+  return {
+    flush,
+    write: (tag: string, message: string): void => {
+      if (last !== null) {
+        if (last.tag === tag && last.message === message) {
+          repeats += 1;
+          if (repeats >= REPEAT_FLUSH_EVERY) flush();
+          return;
+        }
+        flush();
+      }
+      last = { tag, message };
+      append(`${new Date().toISOString()} ${tag} ${redactString(message)}`);
+    },
+  };
+}
+
+/** Tee console.{log,info,warn,error} to `consoleLogPath` (timestamped + token-redacted,
+ *  consecutive duplicates collapsed, capped at `logMaxBytes`). Call once at startup,
+ *  before the banner, so everything shown is captured. Off with LOG=off. Best-effort —
+ *  neither a file error nor a dead console breaks a console call. */
 export function installConsoleTee(): void {
   if (logMode === "off") return;
+  const { write, flush } = dedupingWriter(cappedAppender(consoleLogPath));
+  // Without this a run of repeats that is still open at exit is never recorded, so the
+  // very loop this collapses would leave a short log with no trace of it.
+  process.on("exit", flush);
   const level: Array<["log" | "info" | "warn" | "error", string]> = [
     ["log", "LOG"],
     ["info", "INF"],
@@ -43,10 +136,16 @@ export function installConsoleTee(): void {
   for (const [method, tag] of level) {
     const orig = console[method].bind(console);
     console[method] = (...args: unknown[]): void => {
-      orig(...args);
+      try {
+        orig(...args);
+      } catch {
+        // A closed stdout throws EPIPE from here. It must not escape console.*:
+        // index.ts's uncaughtException handler logs via console.error, so a throw
+        // re-enters it forever — that loop once wrote 5.3 GB of tee file into tmpfs.
+      }
       try {
         const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
-        appendFileSync(consoleLogPath, `${new Date().toISOString()} ${tag} ${redactString(text)}\n`);
+        write(tag, text);
       } catch {
         // best effort — never let logging break a console call
       }
@@ -88,6 +187,10 @@ export function sanitizeForLog(value: unknown): unknown {
   return out;
 }
 
+// Stays one JSON object per line even at the cap, so `jq` over the event log never trips.
+const appendEventLine = cappedAppender(eventLogPath, logMaxBytes, (bytes) =>
+  JSON.stringify({ t: new Date().toISOString(), dir: "diag", sessionId: "", msg: { logCappedBytes: bytes } }));
+
 export function logEvent(
   dir: "out" | "in" | "diag",
   sessionId: string,
@@ -97,12 +200,8 @@ export function logEvent(
   const type = isRecord(msg) && typeof msg.type === "string" ? msg.type : "";
   if (logMode === "normal" && dir === "out" && type === "text_delta") return;
   const line = JSON.stringify({ t: new Date().toISOString(), dir, sessionId, msg: sanitizeForLog(msg) });
-  try {
-    // Synchronous append preserves emission order in the log. Async appendFile
-    // can land out of order, which made tool_start/tool_end look reversed even
-    // though the wire order was correct. Event volume is low; the cost is fine.
-    appendFileSync(eventLogPath, line + "\n");
-  } catch {
-    // best effort — never let logging break the bridge
-  }
+  // Synchronous append (inside the appender) preserves emission order in the log. Async
+  // appendFile can land out of order, which made tool_start/tool_end look reversed even
+  // though the wire order was correct. Event volume is low; the cost is fine.
+  appendEventLine(line);
 }

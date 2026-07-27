@@ -181,7 +181,8 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     switch (event.type) {
       case "model":
         this.model = event.model || "Unknown";
-        this.hooks.model?.(this.model);
+        // Also a store write, and this one runs inside the provider's event dispatch.
+        this.persist(() => this.hooks.model?.(this.model));
         break;
       case "prose":
         this.assistantHistory += event.text;
@@ -245,12 +246,12 @@ export class OwnedSessionBridge implements OwnedAgentSink {
       }
       case "result":
         if (event.usage) this.turnUsage = event.usage;
-        void this.finishTurn(
+        this.finishTurn(
           event.success,
           event.text || (event.cancelled ? "Interrupted." : `${providerName(this.agentProvider)} could not complete the turn.`),
           event.cancelled ?? false,
           event.costUsd ?? 0,
-        );
+        ).catch((error: unknown) => this.reportTurnFailure(error));
         break;
       case "notification":
         this.flushProse();
@@ -262,7 +263,9 @@ export class OwnedSessionBridge implements OwnedAgentSink {
           emit(this.id, { type: "notification", title: `${providerName(this.agentProvider)} session ended`, message: event.message });
           this.hooks.unavailable?.();
         } else {
-          void this.finishFailure(event.message).finally(() => this.hooks.unavailable?.());
+          this.finishFailure(event.message)
+            .finally(() => this.hooks.unavailable?.())
+            .catch((error: unknown) => this.reportTurnFailure(error));
         }
         break;
     }
@@ -354,6 +357,25 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     this.out.text(renderForGlasses(text));
   }
 
+  // Turn completion persists history through synchronous fs writes; an EACCES or a
+  // full disk must degrade this session, never reject into the process-fatal handler.
+  private reportTurnFailure(error: unknown): void {
+    console.warn(`[bridge] owned ${this.id} could not finish the turn: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  /** Run a persistence hook. These reach the session store's synchronous fs writes, so
+   *  a full disk or EACCES throws here — and a throw between `terminalizing = true` and
+   *  the terminal `result` would strand the turn: no result, no idle status, `prompt()`
+   *  rejecting 409 and `interrupt()` returning early, for the life of the process.
+   *  Losing a history line is the acceptable failure; wedging the session is not. */
+  private persist(run: () => void): void {
+    try {
+      run();
+    } catch (error) {
+      this.reportTurnFailure(error);
+    }
+  }
+
   private finishFailure(message: string): Promise<void> {
     if (this.terminalizing || this.state === "idle") return Promise.resolve();
     return this.finishTurn(false, message, false, 0);
@@ -362,34 +384,39 @@ export class OwnedSessionBridge implements OwnedAgentSink {
   private async finishTurn(success: boolean, fallback: string, cancelled: boolean, costUsd: number): Promise<void> {
     if (this.terminalizing || this.state === "idle") return;
     this.terminalizing = true;
-    this.interaction = null;
-    this.pendingWire = null;
-    for (const tool of this.tools.values()) {
-      if (!tool.ended) this.endTool(tool, cancelled ? "Cancelled." : `${providerName(this.agentProvider)} ended before reporting this tool's result.`);
+    // `terminalizing` gates prompt() and interrupt(), so it must be cleared on every
+    // exit — otherwise one failure here leaves the session unusable until a restart.
+    try {
+      this.interaction = null;
+      this.pendingWire = null;
+      for (const tool of this.tools.values()) {
+        if (!tool.ended) this.endTool(tool, cancelled ? "Cancelled." : `${providerName(this.agentProvider)} ended before reporting this tool's result.`);
+      }
+      this.flushProse();
+      await this.out.drain();
+      this.stopStats();
+      const historyText = this.assistantHistory.trim() || (success ? fallback.trim() : "");
+      if (historyText) this.persist(() => this.hooks.assistant?.(historyText));
+      emit(this.id, {
+        type: "result",
+        success,
+        text: renderForGlasses(success && this.lastProseBlock ? this.lastProseBlock : fallback),
+        sessionId: this.id,
+        costUsd,
+        provider: "codex",
+        agentProvider: this.agentProvider,
+        turns: this.turnUsage.turns,
+        durationMs: this.turnStartedMs ? Date.now() - this.turnStartedMs : 0,
+        inputTokens: this.turnUsage.inputTokens,
+        outputTokens: this.turnUsage.outputTokens,
+      });
+      this.state = "idle";
+      this.turnStartedMs = 0;
+      emit(this.id, { type: "status", state: "idle", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
+      this.persist(() => this.hooks.activity?.());
+    } finally {
+      this.terminalizing = false;
     }
-    this.flushProse();
-    await this.out.drain();
-    this.stopStats();
-    const historyText = this.assistantHistory.trim() || (success ? fallback.trim() : "");
-    if (historyText) this.hooks.assistant?.(historyText);
-    emit(this.id, {
-      type: "result",
-      success,
-      text: renderForGlasses(success && this.lastProseBlock ? this.lastProseBlock : fallback),
-      sessionId: this.id,
-      costUsd,
-      provider: "codex",
-      agentProvider: this.agentProvider,
-      turns: this.turnUsage.turns,
-      durationMs: this.turnStartedMs ? Date.now() - this.turnStartedMs : 0,
-      inputTokens: this.turnUsage.inputTokens,
-      outputTokens: this.turnUsage.outputTokens,
-    });
-    this.state = "idle";
-    this.turnStartedMs = 0;
-    emit(this.id, { type: "status", state: "idle", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
-    this.hooks.activity?.();
-    this.terminalizing = false;
   }
 
   private startStats(): void {
