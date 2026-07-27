@@ -68,8 +68,15 @@ recursive DFS under `sessions/` matching the filename suffix `<sessionId>.jsonl`
 (does not prune by the `YYYY/MM/DD` structure).
 
 **Records consumed**:
-- Line 0 `session_meta` (`session_id`, `cli_version`, `cwd`, …) and `turn_context`
-  are **not parsed** (fall through) — see the model gap below.
+- Line 0 `session_meta` and `turn_context` are **not parsed by the timeline**
+  (fall through) — see the model gap below. Since ADR 0007, session discovery
+  (`src/owned-discovery.ts`) *does* read line 0 out-of-band:
+  `payload.session_id` (falling back to `payload.id`, then the filename's
+  trailing UUID — all three carry the same `conversation_id`, verified against
+  `codex-rs/rollout/src/recorder.rs`) and `payload.cwd`, plus file mtime.
+  `payload.originator`/`payload.source` are present but deliberately unused;
+  discovery relies on remembered-id dedupe instead. On a CLI bump, diff these
+  fields too.
 - `event_msg` payloads used: `token_count`, `user_message`, `agent_message`,
   `task_complete`, `web_search_end`, `turn_aborted`, `thread_rolled_back`. **Not**
   used: `task_started`, `mcp_tool_call_end` (tool completion comes from

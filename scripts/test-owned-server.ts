@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 const serverEntry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const fakeGrok = fileURLToPath(new URL("./fixtures/fake-grok.mjs", import.meta.url));
+const fakeCodex = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
 const tsxLoader = fileURLToPath(import.meta.resolve("tsx"));
 const token = "owned-server-test-token";
 
@@ -33,12 +34,15 @@ interface WireMessage {
 /** Exactly one wizard row is always offered so agent and directory can be chosen
  *  before any prompt exists. Setup rows carry no `agentProvider`. */
 const MANAGE_TITLE = "＋ Manage sessions";
+const PICKUP_TITLE = "＋ Pick up session";
 
-/** Setup rows only. The manage row is synthetic too, so it also has no
- *  `agentProvider`, but it is never a way into the wizard. */
+/** Setup rows only. The manage and pickup rows are synthetic too, so they also
+ *  have no `agentProvider`, but neither is a way into the wizard. */
 function assertOneWizardRow(sessions: SessionItem[], title?: string): void {
   const wizard = sessions.filter(
-    (session) => session.agentProvider === undefined && session.title !== MANAGE_TITLE,
+    (session) => session.agentProvider === undefined
+      && session.title !== MANAGE_TITLE
+      && session.title !== PICKUP_TITLE,
   );
   assert.equal(wizard.length, 1, `expected one wizard row, got ${JSON.stringify(sessions.map((s) => s.title))}`);
   if (title !== undefined) assert.equal(wizard[0]?.title, title);
@@ -46,6 +50,9 @@ function assertOneWizardRow(sessions: SessionItem[], title?: string): void {
 
 const manageRow = (sessions: SessionItem[]): SessionItem | undefined =>
   sessions.find((session) => session.title === MANAGE_TITLE);
+
+const pickupRow = (sessions: SessionItem[]): SessionItem | undefined =>
+  sessions.find((session) => session.title === PICKUP_TITLE);
 
 const agentRows = (sessions: SessionItem[]): SessionItem[] =>
   sessions.filter((session) => session.agentProvider !== undefined);
@@ -249,7 +256,12 @@ async function stop(child: ChildProcess): Promise<void> {
   });
 }
 
-function startServer(workspace: string, home: string, scenario = "mixed"): ChildProcess {
+function startServer(
+  workspace: string,
+  home: string,
+  scenario = "mixed",
+  overrides: NodeJS.ProcessEnv = {},
+): ChildProcess {
   const env = { ...process.env };
   delete env.MUX;
   return spawn(process.execPath, ["--import", tsxLoader, serverEntry], {
@@ -259,6 +271,11 @@ function startServer(workspace: string, home: string, scenario = "mixed"): Child
       SOURCE: "owned",
       WORKSPACE_ROOTS: workspace,
       EVEN_BETTER_HOME: home,
+      // Hermetic agent homes: session discovery scans these, and inheriting the
+      // developer's real ~/.claude and ~/.codex would conjure a pickup row from
+      // whatever sessions happen to live on the machine running the tests.
+      CLAUDE_CONFIG_DIR: path.join(workspace, ".claude-home"),
+      CODEX_HOME: path.join(workspace, ".codex-home"),
       CLAUDE_BIN: path.join(workspace, "missing-claude"),
       CODEX_BIN: path.join(workspace, "missing-codex"),
       GROK_BIN: fakeGrok,
@@ -269,6 +286,7 @@ function startServer(workspace: string, home: string, scenario = "mixed"): Child
       QR: "0",
       LOG: "off",
       STREAM_TICK_MS: "1",
+      ...overrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -602,5 +620,110 @@ test("the manage row deletes a remembered session over SSE, and DELETE does the 
   } finally {
     await stop(child);
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("the pickup row adopts a terminal codex session, and the adopted row resumes on open", async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "even-better-owned-pickup-"));
+  const home = path.join(workspace, ".even-better-state");
+  const folder = path.basename(workspace);
+  const uuid = "7f6e5d4c-3b2a-4190-8f7e-6d5c4b3a2918";
+
+  // A rollout exactly where a terminal `codex` session would have left one, inside
+  // the hermetic CODEX_HOME startServer points the server at.
+  const day = new Date();
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const rolloutDir = path.join(
+    workspace, ".codex-home", "sessions",
+    String(day.getFullYear()), pad(day.getMonth() + 1), pad(day.getDate()),
+  );
+  await mkdir(rolloutDir, { recursive: true });
+  await writeFile(path.join(rolloutDir, `rollout-2026-01-01T00-00-00-${uuid}.jsonl`), [
+    JSON.stringify({ type: "session_meta", payload: { session_id: uuid, cwd: workspace, originator: "codex_cli_rs" } }),
+    JSON.stringify({ type: "turn_context", payload: { model: "gpt-5.5" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "refactor the reader" } }),
+    "",
+  ].join("\n"));
+
+  let child = startServer(workspace, home, "mixed", { CODEX_BIN: fakeCodex });
+  try {
+    let base = await waitForServer(child);
+
+    // The row appears once the fire-and-forget discovery probe lands.
+    let row: SessionItem | undefined;
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      row = pickupRow((await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex")).sessions);
+      if (row) break;
+      if (Date.now() > deadline) throw new Error("Timed out waiting for the pickup row");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    // The pickup row is the wizard's twin: same prime, same deferral, same guard.
+    await assertPrimedQuestion(base, row.id, "pick");
+
+    const stream = await openStream(base, row.id);
+    try {
+      await waitFor("the pickup menu", () => asked(stream, "pick") >= 1);
+      const pick = stream.events.find((event) => event.toolUseId?.endsWith(":pick")) as
+        | { toolUseId?: string; questions?: Array<{ options: Array<{ label: string }> }> }
+        | undefined;
+      assert.match(pick?.toolUseId ?? "", /^owned-pickup:/);
+      const label = pick?.questions?.[0]?.options[0]?.label;
+      assert.equal(label, `1 · Codex · ${folder}`);
+
+      await answer(base, row.id, label!);
+      await waitFor("the confirm menu", () => asked(stream, "confirm") >= 1);
+      await answer(base, row.id, "Pick up here");
+      await waitFor(
+        "the adoption notification",
+        () => stream.events.some((event) => event.title === "Session picked up"),
+      );
+    } finally {
+      stream.close();
+    }
+
+    // The adopted row is an ordinary remembered session: codex identity, the
+    // transcript's cwd, and the transcript's first user message as its excerpt.
+    const listed = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    const adopted = agentRows(listed.sessions).find((session) => session.agentProvider === "codex");
+    assert.ok(adopted, `expected an adopted codex row, got ${JSON.stringify(listed.sessions.map((s) => s.title))}`);
+    assert.equal(adopted.cwd, workspace);
+    assert.equal(adopted.status, "idle");
+    assert.equal(adopted.title, `Codex · ${folder} · refactor the reader`);
+
+    // First prompt spawns the fixture and resumes the external thread id; the
+    // fixture then runs its ordinary approval → question → result turn.
+    await api(base, "/prompt", {
+      method: "POST",
+      body: JSON.stringify({ sessionId: adopted.id, text: "continue where I left off" }),
+    }, 202);
+    await waitForMessage(base, adopted.id, "permission_request");
+    await api(base, "/permission-response", {
+      method: "POST",
+      body: JSON.stringify({ sessionId: adopted.id, decision: "allow" }),
+    });
+    await waitForMessage(base, adopted.id, "user_question");
+    await answer(base, adopted.id, "Deep");
+    await waitForMessage(base, adopted.id, "result");
+
+    // Across a restart the adopted row survives as a remembered session, and the
+    // pickup row does not come back: its only candidate is now remembered.
+    await stop(child);
+    child = startServer(workspace, home, "mixed", { CODEX_BIN: fakeCodex });
+    base = await waitForServer(child);
+    const afterRestart = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    assert.equal(afterRestart.sessions.find((session) => session.id === adopted.id)?.agentProvider, "codex");
+    for (let poll = 0; poll < 4; poll++) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const again = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+      assert.equal(pickupRow(again.sessions), undefined, "the pickup row must stay hidden once its candidate is remembered");
+    }
+  } finally {
+    try {
+      await stop(child);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
   }
 });

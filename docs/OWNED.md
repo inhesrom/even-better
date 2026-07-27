@@ -210,6 +210,40 @@ Grok transcripts are untouched. The CLI's removal is refused while a running
 server leases a target row — stop the owning server first; the glasses row and
 the HTTP verb release that lease themselves.
 
+## Picking up terminal sessions
+
+A `claude` or `codex` session started in a plain terminal can be handed to the
+glasses. The **＋ Pick up session** row appears once at least one such session is
+found — recent (last 7 days), inside `WORKSPACE_ROOTS`, its provider's binary
+installed, and not already remembered here (which also hides every session
+even-better itself created). Discovery is read-only: the Claude Agent SDK's
+session listing plus a windowed scan of Codex's rollout files; no process is
+spawned to look.
+
+The row asks which session to pick up — newest first, labelled
+`<n> · Agent · folder` with an `Active <age>` freshness line and, for Claude, a
+title excerpt — paged at `PICKUP_SESSION_LIMIT` (default 4) with **More
+sessions…**, then confirms with **Pick up here** / **Keep in terminal**.
+
+Picking up remembers the session; it does not start a process. The first open or
+prompt resumes the native session exactly like [Persistence and
+resume](#persistence-and-resume) — same lazy attach, same failure notification —
+and the adopted row is an ordinary remembered session from then on: the manage
+row deletes it (which frees the native session for adoption again), and its
+provider and directory are fixed.
+
+**Close the terminal copy first.** Nothing stops the terminal process from
+continuing to write the same native session — the confirm step's warning is the
+only guard. The takeover resumes the same session id in place, which is also
+what makes handing back work: exit the session on the glasses side and run
+`claude --resume <id>` (or pick it from `codex resume`) in a terminal to
+continue there.
+
+To verify against a real session: start `claude` in a directory under
+`WORKSPACE_ROOTS`, exchange a turn, then run `pnpm sim` — the pickup row appears
+in the picker; adopt, prompt from the sim, and afterwards `claude --resume` in
+the terminal shows the glasses turn.
+
 ## Verification
 
 ```bash

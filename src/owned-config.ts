@@ -21,6 +21,9 @@ export interface OwnedConfig {
    *  `directoryLimit` this has no "unlimited": eleven options did not render on a
    *  physical phone, so the menu always pages. */
   manageSessionLimit: number;
+  /** Sessions per page in the pickup row's menu. Paged like `manageSessionLimit`
+   *  and for the same measured reason: eleven options did not render. */
+  pickupSessionLimit: number;
   /** How long after an SSE stream opens a synthetic row's first question is
    *  emitted. Sending it in the same tick is dropped by the app — see
    *  owned-row-question.ts. 500ms was measured on a physical phone; a slower
@@ -140,6 +143,7 @@ export function resolveOwnedConfig(
     maxSessions: integerSetting(env, "MAX_OWNED_SESSIONS", 6, 1, 100),
     directoryLimit: integerSetting(env, "WIZARD_DIRECTORY_LIMIT", 0, 0, 200),
     manageSessionLimit: integerSetting(env, "MANAGE_SESSION_LIMIT", 4, 1, 50),
+    pickupSessionLimit: integerSetting(env, "PICKUP_SESSION_LIMIT", 4, 1, 50),
     setupQuestionDelayMs: integerSetting(env, "SETUP_QUESTION_DELAY_MS", 500, 0, 5_000),
     homeDir: resolveEvenBetterHome(env, startupCwd),
     workspaces: new OwnedWorkspaceCatalog(roots),

@@ -181,15 +181,27 @@ labelled `<n> · Agent · folder`, plus **More sessions…** when a page remains
 Deleting ends that session's SSE stream, so the app sees the row disappear on its
 next `/api/sessions` poll.
 
+A third synthetic row, **＋ Pick up session**, appears once a recent terminal
+`claude`/`codex` session is adoptable (ADR 0007) and sorts after the manage row.
+Its questions are `owned-pickup:<id>:pick` (candidates newest-first, labelled
+`<n> · Agent · folder` with an `Active <age>` description, plus **More
+sessions…** / **Cancel**) and `owned-pickup:<id>:confirm` (**Pick up here** /
+**Keep in terminal**). Adopting emits a **Session picked up** notification and
+the adopted session appears as an ordinary remembered row on the next
+`/api/sessions` poll; the provider resumes when that row is first opened, not at
+adopt time. Like the manage row it rejects prompts with `409`, is never a
+`default()` target, and stays in place with a **No sessions to pick up**
+notification once nothing is left.
+
 **A question's option count is bounded, and the bound is unknown.** Eleven options
 were silently not drawn on a physical phone — same failure signature as the
 same-tick question in ADR 0005: no error, no frame rejected, just a row awaiting an
-answer to a menu that is not there. The delete menu therefore pages at
-`MANAGE_SESSION_LIMIT` (default 4) and has no unlimited setting, unlike
-`WIZARD_DIRECTORY_LIMIT`, whose `0` predates this measurement and is now suspect
-for a workspace with many directories.
+answer to a menu that is not there. The delete and pickup menus therefore page at
+`MANAGE_SESSION_LIMIT` / `PICKUP_SESSION_LIMIT` (default 4) and have no unlimited
+setting, unlike `WIZARD_DIRECTORY_LIMIT`, whose `0` predates this measurement and
+is now suspect for a workspace with many directories.
 
-Opening either synthetic row's `/events` stream emits a `user_prompt` prime, then
+Opening any synthetic row's `/events` stream emits a `user_prompt` prime, then
 the outstanding question after `SETUP_QUESTION_DELAY_MS` (default 500). **A
 `user_question` emitted in the same tick as the stream opening is silently
 dropped by the app** — see ADR 0005 for the measurement. Every stream open

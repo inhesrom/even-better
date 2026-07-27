@@ -6,6 +6,12 @@ import path from "node:path";
 import { after, test } from "node:test";
 import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo } from "../src/owned-agent.js";
 import type { OwnedConfig, OwnedProviderConfig } from "../src/owned-config.js";
+import type {
+  ExternalSessionCandidate,
+  ExternalSessionInspection,
+  ExternalSessionSource,
+  PickupProvider,
+} from "../src/owned-discovery.js";
 import { OwnedSessionCatalog } from "../src/owned-session-catalog.js";
 import { OwnedSessionStore, type RememberedSessionMetadata } from "../src/owned-session-store.js";
 import { OwnedWorkspaceCatalog } from "../src/owned-workspaces.js";
@@ -31,6 +37,7 @@ function config(homeDir: string, maxSessions = 6, directoryLimit = 0): OwnedConf
     maxSessions,
     directoryLimit,
     manageSessionLimit: 4,
+    pickupSessionLimit: 4,
     // The real delay exists only to survive the app's renderer; settle() covers the
     // one tick setTimeout(0) still costs.
     setupQuestionDelayMs: 0,
@@ -790,6 +797,214 @@ test("the delete menu pages instead of growing past what the glasses render", as
     assert.equal(await catalog.get(newest.id), undefined);
     // After a delete the list shifted, so paging restarts at the oldest.
     assert.ok(options()[0]?.label.startsWith("1 · "));
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ＋ Pick up session: adopting external CLI sessions (takeover-by-resume).
+
+const PICKUP_TITLE = "＋ Pick up session";
+
+class FakeSource implements ExternalSessionSource {
+  candidateCalls = 0;
+  constructor(
+    public available: ExternalSessionCandidate[],
+    public inspection: () => Promise<ExternalSessionInspection | null> =
+      () => Promise.resolve({ model: "fake-model", firstPrompt: "refactor the parser" }),
+  ) {}
+
+  candidates(providers: readonly PickupProvider[]): Promise<ExternalSessionCandidate[]> {
+    this.candidateCalls++;
+    return Promise.resolve(this.available.filter((candidate) => providers.includes(candidate.agentProvider)));
+  }
+
+  inspect(): Promise<ExternalSessionInspection | null> {
+    return this.inspection();
+  }
+}
+
+function externalClaude(id: string, cwd: string, lastModifiedMs = Date.now()): ExternalSessionCandidate {
+  return { agentProvider: "claude", nativeSessionId: id, cwd, title: "refactor the parser", lastModifiedMs };
+}
+
+/** The pickup row appears on a poll after the fire-and-forget probe lands. */
+async function waitForPickupRow(catalog: OwnedSessionCatalog): Promise<SessionDescriptor> {
+  const deadline = Date.now() + 4_000;
+  for (;;) {
+    const row = (await catalog.list()).find((item) => item.title === PICKUP_TITLE);
+    if (row) return row;
+    if (Date.now() > deadline) throw new Error("Timed out waiting for the pickup row");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function openPickup(catalog: OwnedSessionCatalog): Promise<LiveSession> {
+  const row = await waitForPickupRow(catalog);
+  const session = await catalog.get(row.id);
+  assert.ok(session);
+  await session.onConnect?.();
+  session.replayPending?.();
+  await settle(() => asked(session, "pick") >= 1);
+  return session;
+}
+
+test("adopting an external session persists a record without spawning, then resumes it on first prompt", async () => {
+  const home = path.join(scratch, "state-pickup-adopt");
+  const agents: FakeAgent[] = [];
+  const source = new FakeSource([externalClaude("external-claude-1", project)]);
+  const store = new OwnedSessionStore(home);
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents), store, source);
+  try {
+    const pickup = await openPickup(catalog);
+
+    await pickup.respondQuestion("1 · Claude · project");
+    await settle(() => asked(pickup, "confirm") >= 1);
+    await pickup.respondQuestion("Pick up here");
+    await settle(() => notified(pickup, "Session picked up"));
+
+    // The record exists, carries the external id, and no agent process started.
+    const records = store.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.nativeSessionId, "external-claude-1");
+    assert.equal(records[0]?.agentProvider, "claude");
+    assert.equal(records[0]?.cwd, project);
+    assert.equal(records[0]?.model, "fake-model");
+    assert.equal(records[0]?.firstPrompt, "refactor the parser");
+    assert.equal(agents.length, 0);
+
+    // Fixed synthetic-row order: wizard, manage, pickup, then remembered rows.
+    const rows = await catalog.list();
+    assert.deepEqual(
+      rows.map((row) => row.title),
+      ["＋ Agent setup", MANAGE_TITLE, PICKUP_TITLE, "Claude · project · refactor the parser"],
+    );
+
+    // The candidate is deduped away, so the re-asked menu is the empty state.
+    await settle(() => notified(pickup, "No sessions to pick up"));
+
+    // First prompt attaches through the ordinary path and resumes the external id.
+    const adopted = await catalog.get(records[0]!.id);
+    assert.ok(adopted);
+    await adopted.prompt("hello");
+    assert.equal(agents.length, 1);
+    assert.deepEqual(agents[0]?.resumes, ["external-claude-1"]);
+
+    // Forgetting the adopted row releases the native session for adoption again.
+    await catalog.forget(records[0]!.id);
+    assert.deepEqual(store.list(), []);
+    assert.equal((await catalog.adoptable(true)).length, 1);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("cancel, keep, and unrecognized answers never adopt; failures notify without persisting", async () => {
+  const home = path.join(scratch, "state-pickup-refusals");
+  const source = new FakeSource([externalClaude("external-claude-2", project)]);
+  const store = new OwnedSessionStore(home);
+  const catalog = new OwnedSessionCatalog(config(home), factory([]), store, source);
+  try {
+    const pickup = await openPickup(catalog);
+
+    // The literal "skip" index.ts substitutes for an empty body keeps the session.
+    await pickup.respondQuestion("1 · Claude · project");
+    await settle(() => asked(pickup, "confirm") >= 1);
+    await pickup.respondQuestion("skip");
+    await settle(() => asked(pickup, "confirm") >= 2);
+    await pickup.respondQuestion("Keep in terminal");
+    await settle(() => asked(pickup, "pick") >= 2);
+    await pickup.respondQuestion("Cancel");
+    await settle(() => notified(pickup, "Nothing picked up"));
+    assert.deepEqual(store.list(), []);
+
+    // A candidate whose transcript vanished between pick and adopt.
+    source.inspection = () => Promise.resolve(null);
+    await settle(() => asked(pickup, "pick") >= 3);
+    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("Pick up here");
+    await settle(() => notified(pickup, "Could not pick up session"));
+    assert.deepEqual(store.list(), []);
+
+    // A cwd outside WORKSPACE_ROOTS is refused with the actionable message. The
+    // menu on screen predates the swap, so Cancel forces a rebuild that shows the
+    // outside candidate before it is picked.
+    const outside = await mkdtemp(path.join(os.tmpdir(), "even-better-pickup-outside-"));
+    try {
+      source.available = [externalClaude("external-claude-3", outside)];
+      source.inspection = () => Promise.resolve({ model: "fake-model" });
+      await pickup.respondQuestion("Cancel");
+      await settle(() => asked(pickup, "pick") >= 5);
+      await pickup.respondQuestion("1 · Claude · " + path.basename(outside));
+      await pickup.respondQuestion("Pick up here");
+      await settle(() => getMessages(pickup.id, 0).some((message) =>
+        (message as { message?: string }).message?.includes("WORKSPACE_ROOTS") === true,
+      ));
+      assert.deepEqual(store.list(), []);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("answers are rejected while an adopt is in flight, and the pick menu pages", async () => {
+  const home = path.join(scratch, "state-pickup-paging");
+  const many = Array.from({ length: 6 }, (_, index) =>
+    externalClaude(`external-claude-page-${index}`, project, Date.now() - index * 1_000));
+  let releaseInspect: (value: ExternalSessionInspection | null) => void = () => undefined;
+  const source = new FakeSource(many, () => new Promise((resolve) => { releaseInspect = resolve; }));
+  const store = new OwnedSessionStore(home);
+  const catalog = new OwnedSessionCatalog(config(home), factory([]), store, source);
+  try {
+    const pickup = await openPickup(catalog);
+    const options = (): Array<{ label: string }> => {
+      const wire = getMessages(pickup.id, 0)
+        .filter((message) => (message as { toolUseId?: string }).toolUseId?.endsWith(":pick"))
+        .at(-1) as { questions?: Array<{ options: Array<{ label: string }> }> } | undefined;
+      return wire?.questions?.[0]?.options ?? [];
+    };
+
+    // Four candidates + More + Cancel, newest first.
+    assert.equal(options().length, 6);
+    assert.equal(options().at(-2)?.label, "More sessions…");
+    assert.ok(options()[0]?.label.startsWith("1 · "));
+    await pickup.respondQuestion("More sessions…");
+    await settle(() => asked(pickup, "pick") >= 2);
+    // The tail page: ordinals continue rather than restart.
+    assert.equal(options().length, 3);
+    assert.ok(options()[0]?.label.startsWith("5 · "));
+
+    await pickup.respondQuestion(options()[0]!.label);
+    await settle(() => asked(pickup, "confirm") >= 1);
+    // The confirm answer resolves only once the adopt finishes (the deferred
+    // inspect holds it open), which is exactly the window a second answer races.
+    const inflight = pickup.respondQuestion("Pick up here");
+    await assert.rejects(pickup.respondQuestion("anything"), /being picked up/);
+    releaseInspect({ model: "fake-model" });
+    await inflight;
+    await settle(() => notified(pickup, "Session picked up"));
+    assert.equal(store.list().length, 1);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("adoptable() offers nothing when the provider binary is missing, and adopt() refuses", async () => {
+  const home = path.join(scratch, "state-pickup-no-provider");
+  const source = new FakeSource([externalClaude("external-claude-4", project)]);
+  const grokOnly = config(home);
+  grokOnly.providers = { grok: providerConfig };
+  const catalog = new OwnedSessionCatalog(grokOnly, factory([]), new OwnedSessionStore(home), source);
+  try {
+    assert.deepEqual(await catalog.adoptable(true), []);
+    assert.equal(source.candidateCalls, 0);
+    await assert.rejects(catalog.adopt(externalClaude("external-claude-4", project)), /Claude is unavailable/);
+    // No candidates ⇒ the probe never creates the row.
+    const rows = await catalog.list();
+    assert.equal(rows.find((row) => row.title === PICKUP_TITLE), undefined);
   } finally {
     await catalog.dispose();
   }

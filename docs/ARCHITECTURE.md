@@ -62,6 +62,8 @@ OwnedSessionCatalog
   ├─ one wizard row (＋ Agent setup; openable before any prompt exists)
   ├─ one manage row (＋ Manage sessions; appears once something is remembered)
   │    └─ catalog.forget(id) — dispose, drop, then OwnedSessionStore.remove
+  ├─ one pickup row (＋ Pick up session; appears once a terminal CLI session is adoptable)
+  │    └─ catalog.adopt(candidate) — synthesize record + lease; resume on first open (ADR 0007)
   └─ remembered sessions (metadata + display history; lazily attached)
        └─ OwnedSessionBridge (wire events, pacing, interaction state)
             └─ OwnedAgent

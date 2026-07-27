@@ -27,6 +27,7 @@ test("owned config is explicit, bounded, strips the bridge token, and omits miss
     EVEN_BETTER_HOME: path.join(root, "state"),
   });
   assert.equal(config.maxSessions, 8);
+  assert.equal(config.pickupSessionLimit, 4);
   assert.equal(config.homeDir, path.join(root, "state"));
   assert.equal(config.providers.claude, undefined);
   assert.equal(config.providers.codex?.bin, fakeCodex);
@@ -41,6 +42,8 @@ test("owned config defaults roots to launch cwd and rejects mux combinations, in
   assert.deepEqual(implicit.workspaces.roots, [root]);
   assert.throws(() => resolveOwnedConfig({ SOURCE: "owned", WORKSPACE_ROOTS: root, MUX: "cmux", GROK_BIN: fakeGrok }), /cannot be combined/);
   assert.throws(() => resolveOwnedConfig({ SOURCE: "owned", WORKSPACE_ROOTS: root, GROK_BIN: fakeGrok, MAX_OWNED_SESSIONS: "0" }), /invalid MAX_OWNED_SESSIONS/);
+  assert.throws(() => resolveOwnedConfig({ SOURCE: "owned", WORKSPACE_ROOTS: root, GROK_BIN: fakeGrok, PICKUP_SESSION_LIMIT: "0" }), /invalid PICKUP_SESSION_LIMIT/);
+  assert.equal(resolveOwnedConfig({ SOURCE: "owned", GROK_BIN: fakeGrok, PICKUP_SESSION_LIMIT: "9" }, root).pickupSessionLimit, 9);
   assert.throws(() => resolveOwnedConfig({
     SOURCE: "owned",
     WORKSPACE_ROOTS: root,

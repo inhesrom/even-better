@@ -58,8 +58,15 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   with no prompt lands idle and asks for one.
 - **`owned-manage-session.ts` / `owned-row-question.ts`** — the second synthetic
   row (**＋ Manage sessions**: pick → confirm → `catalog.forget`) and the prime +
-  deferral both synthetic rows need to get a menu rendered. That mechanism is one
+  deferral every synthetic row needs to get a menu rendered. That mechanism is one
   measurement, not a preference, so it lives in one place rather than in each row.
+- **`owned-pickup-session.ts` / `owned-discovery.ts`** — the third synthetic row
+  (**＋ Pick up session**: pick → confirm → `catalog.adopt`) for taking over
+  `claude`/`codex` sessions the user started in a terminal, and the read-only
+  discovery behind it (SDK `listSessions` for Claude, windowed rollout
+  `session_meta` scan for Codex). Adopt synthesizes a remembered record around
+  the external `nativeSessionId`; the ordinary lazy attach resumes it on first
+  open. See ADR 0007.
 - **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
   and common owned bridge. Provider adapters own only their native protocol;
   the common bridge owns public IDs, pacing, interactions, and wire events.
@@ -206,16 +213,28 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   `user_prompt` prime and `replayPending` defers the question by
   `SETUP_QUESTION_DELAY_MS`, on every stream open including reconnects. Answers may
   emit their follow-up question synchronously; only the first one after a stream
-  opens needs the deferral. Both halves live in `owned-row-question.ts` because the
-  wizard and the manage row both depend on them and neither can afford to drift.
-  `assertPrimedQuestion` in `test-owned-server.ts` is the guard for both.
+  opens needs the deferral. Both halves live in `owned-row-question.ts` because
+  every synthetic row depends on them and none can afford to drift.
+  `assertPrimedQuestion` in `test-owned-server.ts` is the guard for all of them.
 - **A question's option count is bounded, and the ceiling is unknown.** Eleven
   options (ten sessions + Cancel) were silently not drawn on a physical phone;
   four are fine. The signature is identical to the same-tick question above — no
   error, nothing rejected, just a row stuck `awaiting` an answer to a menu that
   does not exist, which reads on the glasses as thinking forever. Long menus must
-  page (`MANAGE_SESSION_LIMIT`), not grow. `WIZARD_DIRECTORY_LIMIT`'s `0` predates
-  this and is unverified for a workspace with many directories.
+  page (`MANAGE_SESSION_LIMIT`, `PICKUP_SESSION_LIMIT`), not grow.
+  `WIZARD_DIRECTORY_LIMIT`'s `0` predates this and is unverified for a workspace
+  with many directories.
+- **External-session discovery never spawns a process and never surfaces an error
+  through `list()`.** Scans are read-only, per-provider time-bounded, and a failed
+  one contributes an empty list — the pickup row goes quiet instead of taking the
+  session list down. Candidates dedupe against every remembered
+  `nativeSessionId` (which also excludes even-better's own children — owned
+  agents share the user's real `~/.claude`/`~/.codex`), the transcript cwd passes
+  the same workspace validation as a phone answer, and adopt never attaches —
+  resume happens on first open, where the existing failure notification already
+  lives. Nothing guards the terminal copy still writing the same native session;
+  the confirm step's warning is deliberate (ADR 0007), not a gap to fix with
+  process scanning.
 - **Only ＋ (U+FF0B) and `·` are known to render in a row title.** 🗑 did not.
   Titles are the one place an unrenderable glyph costs a whole feature, since the
   row is how it is reached.
