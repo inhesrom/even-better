@@ -203,6 +203,21 @@ background and reports over SSE. The phone's creation and follow-up `provider` a
 fields are ignored; the glasses wizard is authoritative and cannot retarget an
 existing remembered session.
 
+## Command questions
+
+Owned mode reuses `user_question` for slash commands (`docs/OWNED.md`). Their
+`toolUseId` is `owned-command:<sessionId>:<pick|args|confirm>`, distinguishing
+them from the wizard's `owned-setup:` questions and from a provider's own
+questions, which carry `owned-question:`.
+
+A command question is emitted **inside a turn** — `user_prompt` and
+`status: busy` go first, exactly as for a provider question — and the turn stays
+open until the chosen command finishes, so one `result` closes the whole
+interaction. This is deliberate: ADR 0004 established that the app ignores a
+question the user's own prompt did not trigger, and a menu emitted with no turn
+in flight is the same untested shape. The answer is consumed by the bridge and
+never reaches the provider.
+
 ## Not wire types
 
 Grepping `type: "..."` also hits two values that are **not** protocol events:

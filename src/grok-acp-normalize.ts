@@ -38,7 +38,14 @@ export type NormalizedUpdate =
   | { kind: "tool"; patch: NormalizedToolPatch }
   | { kind: "plan"; entries: PlanEntry[] }
   | { kind: "usage_context"; used: number; size: number }
+  | { kind: "commands"; commands: NormalizedCommand[] }
   | { kind: "metadata"; updateType: string };
+
+export interface NormalizedCommand {
+  name: string;
+  description: string;
+  argumentHint?: string;
+}
 
 export interface NormalizedQuestionOption {
   label: string;
@@ -177,6 +184,16 @@ export function normalizeSessionNotification(notification: SessionNotification):
     case "usage_update":
       return { kind: "usage_context", used: update.used, size: update.size };
     case "available_commands_update":
+      return {
+        kind: "commands",
+        commands: update.availableCommands.map((command) => ({
+          name: command.name,
+          description: command.description,
+          // ACP models arguments as an unstructured input hint; everything after the
+          // command name is passed through verbatim, exactly like Claude's argumentHint.
+          ...(command.input?.hint ? { argumentHint: command.input.hint } : {}),
+        })),
+      };
     case "current_mode_update":
     case "config_option_update":
     case "session_info_update":

@@ -39,6 +39,21 @@ function update(value, meta) {
   notify("session/update", { sessionId, update: value, ...(meta ? { _meta: meta } : {}) });
 }
 
+/** The command list a real ACP agent advertises, so `pnpm sim --fake` can drive the
+ *  whole picker: two names sharing a prefix, one taking arguments, one destructive. */
+function advertiseCommands() {
+  update({
+    sessionUpdate: "available_commands_update",
+    availableCommands: [
+      { name: "usage", description: "Show token usage for this session" },
+      { name: "compact", description: "Compact the conversation" },
+      { name: "grill", description: "Grill the current plan" },
+      { name: "grill-me", description: "Grill me about a decision" },
+      { name: "research", description: "Research a topic", input: { hint: "<topic>" } },
+    ],
+  });
+}
+
 async function happyPrompt(id) {
   turn++;
   const promptId = `prompt-${turn}`;
@@ -204,6 +219,9 @@ async function handleRequest(message) {
   }
   if (method === "session/new") {
     respond(id, { sessionId, _meta: { models: { currentModelId: "fake-grok-model" } } });
+    // ACP agents advertise commands as a session notification after creation, not in
+    // the session/new response — NewSessionResponse has no field for them.
+    advertiseCommands();
     return;
   }
   if (method === "session/load" || method === "session/resume") {
@@ -213,6 +231,9 @@ async function handleRequest(message) {
       content: { type: "text", text: "historical native replay" },
     });
     respond(id, { _meta: { models: { currentModelId: "fake-grok-model" } } });
+    // After the load, not during it: the bridge suppresses session updates while a
+    // resume is in flight, so a list sent inside that window would be dropped.
+    advertiseCommands();
     return;
   }
   if (method === "session/prompt") {

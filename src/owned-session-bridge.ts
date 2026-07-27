@@ -4,9 +4,18 @@ import type {
   OwnedAgentEvent,
   OwnedAgentSink,
   OwnedAgentStartInfo,
+  OwnedCommand,
   OwnedPermissionDecision,
   OwnedUsage,
 } from "./owned-agent.js";
+import {
+  commandText,
+  isDestructive,
+  parseAnswer,
+  parseCommandInput,
+  resolveCommand,
+  suggestCommands,
+} from "./owned-commands.js";
 import { OutputStream } from "./output-stream.js";
 import { renderForGlasses } from "./render.js";
 import { SessionControlError, type SessionState } from "./session.js";
@@ -27,7 +36,18 @@ interface ToolState {
 
 type Interaction =
   | { type: "permission"; toolName: string; options: OwnedPermissionDecision[] }
-  | { type: "question" };
+  | { type: "question" }
+  // A bridge-local interaction: its answer resolves a command and never reaches the
+  // provider. `pick` chooses among near-misses, `args` collects a command's input,
+  // `confirm` guards a destructive command.
+  | { type: "command"; stage: "pick" | "args" | "confirm"; candidates: OwnedCommand[]; chosen: OwnedCommand | null; args: string };
+
+type CommandPlan =
+  | { kind: "prose" }
+  | { kind: "dispatch"; text: string }
+  | { kind: "ask"; interaction: Extract<Interaction, { type: "command" }> };
+
+const CANCEL = "Cancel";
 
 function inputObject(input: unknown): Record<string, unknown> {
   if (typeof input === "object" && input !== null && !Array.isArray(input)) {
@@ -65,6 +85,7 @@ export class OwnedSessionBridge implements OwnedAgentSink {
   private lastProseBlock = "";
   private tools = new Map<string, ToolState>();
   private interaction: Interaction | null = null;
+  private availableCommands: OwnedCommand[] = [];
   private pendingWire: object | null = null;
   private turnUsage: OwnedUsage = { inputTokens: 0, outputTokens: 0, turns: 0 };
   private assistantHistory = "";
@@ -93,15 +114,50 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     if (this.state !== "idle" || this.terminalizing) {
       throw new SessionControlError(`${providerName(this.agentProvider)} is already processing a prompt.`, 409);
     }
+    const plan = this.planCommand(text);
     this.beginTurn();
     emit(this.id, { type: "user_prompt", text });
     emit(this.id, { type: "status", state: "busy", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
+    // The turn is open before this point, so every command path that stops to ask is
+    // inside a turn `finishTurn` will close — cancellation included.
+    if (plan.kind === "ask") {
+      this.askCommand(plan.interaction);
+      return;
+    }
     try {
-      await this.agent.prompt(text);
+      await this.agent.prompt(plan.kind === "dispatch" ? plan.text : text);
     } catch (error) {
       await this.finishFailure(error instanceof Error ? error.message : String(error));
       throw error;
     }
+  }
+
+  /** Decide what a prompt means against the provider's live command list. Ordinary
+   *  prose — and every prompt to a provider that advertises nothing — takes the
+   *  untouched path it took before commands existed. */
+  private planCommand(text: string): CommandPlan {
+    if (!this.availableCommands.length) return { kind: "prose" };
+    const phrase = parseCommandInput(text);
+    if (phrase === null) return { kind: "prose" };
+    const resolved = resolveCommand(phrase, this.availableCommands);
+    if (!resolved) {
+      // Three, not four: Cancel is appended to every command question, and four
+      // options is the largest menu the glasses are known to render (the directory
+      // step's `choices(4)`). Five is untested, and this is not the place to find out.
+      const candidates = suggestCommands(phrase, this.availableCommands, 3);
+      // Nothing close enough to offer: hand the provider the slash form anyway. It
+      // owns its own command vocabulary and reports an unknown one better than we can
+      // guess — and this is also how a command it never advertised still reaches it.
+      if (!candidates.length) return { kind: "dispatch", text: `/${phrase}` };
+      return { kind: "ask", interaction: { type: "command", stage: "pick", candidates, chosen: null, args: "" } };
+    }
+    if (resolved.command.argumentHint && !resolved.args) {
+      return { kind: "ask", interaction: { type: "command", stage: "args", candidates: [], chosen: resolved.command, args: "" } };
+    }
+    if (isDestructive(resolved.command)) {
+      return { kind: "ask", interaction: { type: "command", stage: "confirm", candidates: [], chosen: resolved.command, args: resolved.args } };
+    }
+    return { kind: "dispatch", text: commandText(resolved) };
   }
 
   async respondPermission(decision: string): Promise<void> {
@@ -131,6 +187,10 @@ export class OwnedSessionBridge implements OwnedAgentSink {
   }
 
   async respondQuestion(answer: string): Promise<void> {
+    if (this.interaction?.type === "command") {
+      await this.answerCommand(this.interaction, answer);
+      return;
+    }
     if (!this.interaction || this.interaction.type !== "question") {
       throw new SessionControlError(`No matching ${providerName(this.agentProvider)} question.`, 409);
     }
@@ -147,6 +207,16 @@ export class OwnedSessionBridge implements OwnedAgentSink {
 
   async interrupt(): Promise<void> {
     if (this.state === "idle" || this.terminalizing) return;
+    if (this.interaction?.type === "command") {
+      // The pseudo-turn has not reached the provider, so `agent.interrupt()` finds no
+      // active turn and returns without doing anything — leaving the session busy with
+      // nothing running. Ending the turn here is the only thing that can release it,
+      // and it is the escape hatch if a command menu ever fails to render.
+      this.interaction = null;
+      this.pendingWire = null;
+      await this.finishTurn(true, "Cancelled.", true, 0);
+      return;
+    }
     this.interaction = null;
     this.pendingWire = null;
     this.state = "busy";
@@ -183,6 +253,9 @@ export class OwnedSessionBridge implements OwnedAgentSink {
         this.model = event.model || "Unknown";
         // Also a store write, and this one runs inside the provider's event dispatch.
         this.persist(() => this.hooks.model?.(this.model));
+        break;
+      case "commands":
+        this.availableCommands = event.commands;
         break;
       case "prose":
         this.assistantHistory += event.text;
@@ -268,6 +341,115 @@ export class OwnedSessionBridge implements OwnedAgentSink {
             .catch((error: unknown) => this.reportTurnFailure(error));
         }
         break;
+    }
+  }
+
+  /** Put a command question on the glasses. Wire-identical to a provider question —
+   *  same `user_question` type, same `pendingWire` replay on reconnect — because the
+   *  app renders one menu shape and this must not be a second, special one. */
+  private askCommand(interaction: Extract<Interaction, { type: "command" }>): void {
+    this.state = "awaiting";
+    this.interaction = interaction;
+    const { question, options } = this.commandQuestion(interaction);
+    const wire = {
+      type: "user_question",
+      questions: [{
+        question,
+        header: "Command",
+        // Cancel is on every stage: an abandoned picker would otherwise hold the turn
+        // open forever, and a turn that never terminalizes wedges prompt() and
+        // interrupt() for the life of the process.
+        options: [...options, { label: CANCEL, description: "Do not run a command." }],
+      }],
+      toolUseId: `owned-command:${this.id}:${interaction.stage}`,
+    };
+    this.pendingWire = wire;
+    this.out.event(wire);
+  }
+
+  private commandQuestion(
+    interaction: Extract<Interaction, { type: "command" }>,
+  ): { question: string; options: Array<{ label: string; description: string }> } {
+    if (interaction.stage === "pick") {
+      return {
+        question: "Which command did you mean?",
+        options: interaction.candidates.map((command) => ({
+          label: `/${command.name}`,
+          description: command.description || "Run this command.",
+        })),
+      };
+    }
+    const command = interaction.chosen!;
+    if (interaction.stage === "args") {
+      return {
+        question: `What should /${command.name} run on? ${command.argumentHint ?? ""}`.trim(),
+        // The options are only a shortcut; the directory step already proves the app
+        // accepts a typed answer that matches none of them.
+        options: [{ label: "No arguments", description: `Run /${command.name} with nothing else.` }],
+      };
+    }
+    return {
+      question: `Run /${command.name}? This cannot be undone.`,
+      options: [{ label: `Run /${command.name}`, description: command.description || "Run this command." }],
+    };
+  }
+
+  /** Advance the command interaction. The answer never reaches the provider: the
+   *  terminal stage dispatches inside the turn already opened by `prompt()`, so one
+   *  `result` still closes it. */
+  private async answerCommand(
+    interaction: Extract<Interaction, { type: "command" }>,
+    answer: string,
+  ): Promise<void> {
+    const value = parseAnswer(answer).trim();
+    this.interaction = null;
+    this.pendingWire = null;
+    emit(this.id, { type: "question_answer", answers: { answer: value } });
+    if (!value || value.toLowerCase() === CANCEL.toLowerCase()) {
+      await this.finishTurn(true, "Cancelled.", true, 0);
+      return;
+    }
+    if (interaction.stage === "pick") {
+      const wanted = value.replace(/^\//, "").trim().toLowerCase();
+      const chosen = interaction.candidates.find((command) => command.name.toLowerCase() === wanted);
+      if (!chosen) {
+        // Re-ask rather than guess: an unmatched answer here means the app sent
+        // something we did not offer, and picking one anyway could run the wrong thing.
+        this.askCommand(interaction);
+        return;
+      }
+      if (chosen.argumentHint) {
+        this.askCommand({ type: "command", stage: "args", candidates: [], chosen, args: "" });
+        return;
+      }
+      if (isDestructive(chosen)) {
+        this.askCommand({ type: "command", stage: "confirm", candidates: [], chosen, args: "" });
+        return;
+      }
+      await this.dispatchCommand(chosen, "");
+      return;
+    }
+    const command = interaction.chosen!;
+    if (interaction.stage === "args") {
+      const args = value.toLowerCase() === "no arguments" ? "" : value;
+      if (isDestructive(command)) {
+        this.askCommand({ type: "command", stage: "confirm", candidates: [], chosen: command, args });
+        return;
+      }
+      await this.dispatchCommand(command, args);
+      return;
+    }
+    await this.dispatchCommand(command, interaction.args);
+  }
+
+  private async dispatchCommand(command: OwnedCommand, args: string): Promise<void> {
+    this.state = "busy";
+    const text = commandText({ command, args });
+    emit(this.id, { type: "status", state: "busy", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
+    try {
+      await this.agent.prompt(text);
+    } catch (error) {
+      await this.finishFailure(error instanceof Error ? error.message : String(error));
     }
   }
 

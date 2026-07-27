@@ -110,6 +110,41 @@ A resume failure keeps the row and history and emits an actionable notification.
 Native transcripts remain the source of conversational context; even-better's
 copy exists for phone display and catalog recovery.
 
+## Slash commands
+
+Providers that advertise a command list expose it to the glasses. Claude takes
+its list from the Agent SDK handshake and refreshes it on `commands_changed`, so
+built-ins, custom commands, and skills discovered mid-session are all reachable.
+Grok takes its list from the ACP `available_commands_update` notification. Codex
+advertises nothing — its app-server has no command surface — so Codex sessions
+behave exactly as they did before, and every prompt goes through untouched.
+
+Execution is passthrough: a resolved command is sent as `/name args`, which both
+providers parse themselves. even-better never implements a command.
+
+Because the composer is voice-first, both `/compact` and the spoken **"slash
+compact"** are accepted. The phrase after the marker is resolved against the
+live list, longest name first — so with both `/grill` and `/grill-me`
+advertised, "slash grill me" runs `/grill-me` rather than `/grill` with the
+argument "me". A single-word command still absorbs the rest as arguments, which
+is what "slash research auth flow" needs. Spelling is folded before comparison,
+so `plugin:deploy` is reachable as "slash plugin deploy".
+
+What happens next depends on what the phrase resolved to:
+
+| Outcome | Behaviour |
+|---|---|
+| One command, arguments satisfied | Runs immediately |
+| One command that takes arguments, none given | Asks for them; any typed answer is accepted |
+| `/clear`, `/compact`, `/rewind` | Asks to confirm — these discard context and cannot be undone |
+| Several near-misses | Asks which, offering up to four |
+| Nothing close enough | Sent to the provider as `/phrase`, which reports its own unknown command |
+
+Ordinary prose is never intercepted: without the slash marker, "compact the
+summary" is a prompt. Every command question carries **Cancel**, and
+`POST /interrupt` also ends it — a command question opens a turn that has not
+reached the provider, so nothing else could release the session.
+
 ## Providers and compatibility identity
 
 Owned mode uses one stock-app Codex connection for every row. `/api/info`,

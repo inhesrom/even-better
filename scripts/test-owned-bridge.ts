@@ -120,3 +120,159 @@ test("a healthy turn still reports history and activity exactly once", async () 
   assert.ok(typesOf(id).includes("result"));
   await bridge.dispose();
 });
+
+/** A stub that advertises commands, so the bridge's dispatch path is reachable. */
+class CommandAgent extends StubAgent {
+  private readonly list = [
+    { name: "usage", description: "Show usage" },
+    { name: "compact", description: "Compact the context" },
+    { name: "grill", description: "Grill" },
+    { name: "grill-me", description: "Grill me" },
+    { name: "research", description: "Research", argumentHint: "<topic>" },
+  ];
+
+  commands(): typeof this.list {
+    return this.list;
+  }
+}
+
+/** Start a bridge with its command list already advertised, and always dispose it:
+ *  a bridge left mid-turn keeps its 10s stats interval alive and the runner never exits. */
+async function commandBridge(
+  id: string,
+  run: (bridge: InstanceType<typeof OwnedSessionBridge>, agent: CommandAgent) => Promise<void>,
+): Promise<void> {
+  const agent = new CommandAgent();
+  const bridge = new OwnedSessionBridge(id, agent);
+  await bridge.start();
+  agent.sink!.event({ type: "commands", commands: agent.commands() });
+  try {
+    await run(bridge, agent);
+  } finally {
+    await bridge.dispose();
+  }
+}
+
+const lastQuestion = (id: string): { question: string; options: { label: string }[] } => {
+  const wire = getMessages(id, 0).filter((message) => (message as { type?: string }).type === "user_question").pop();
+  return (wire as unknown as { questions: { question: string; options: { label: string }[] }[] }).questions[0];
+};
+
+test("an unambiguous command dispatches straight through as its slash form", async () => {
+  await commandBridge("owned:cmd-direct", async (bridge, agent) => {
+    await bridge.prompt("slash usage");
+    // No menu: the spoken form resolved to exactly one command that needs nothing else.
+    assert.deepEqual(agent.prompts, ["/usage"]);
+    assert.equal(typesOf("owned:cmd-direct").includes("user_question"), false);
+    assert.equal(bridge.state, "busy");
+  });
+});
+
+test("prose is untouched, and so is every prompt to a provider with no commands", async () => {
+  await commandBridge("owned:cmd-prose", async (bridge, agent) => {
+    await bridge.prompt("compact the summary please");
+    assert.deepEqual(agent.prompts, ["compact the summary please"]);
+  });
+
+  // Codex advertises nothing, so its sessions behave exactly as they did before.
+  const bare = new StubAgent();
+  const codex = new OwnedSessionBridge("owned:cmd-none", bare);
+  await codex.start();
+  await codex.prompt("/compact");
+  assert.deepEqual(bare.prompts, ["/compact"]);
+  await codex.dispose();
+});
+
+test("an ambiguous phrase asks which command, then runs the pick", async () => {
+  const id = "owned:cmd-pick";
+  await commandBridge(id, async (bridge, agent) => {
+    await bridge.prompt("slash gril");
+    await waitFor("the picker", () => typesOf(id).includes("user_question"));
+    assert.equal(bridge.state, "awaiting");
+    assert.deepEqual(lastQuestion(id).options.map((option) => option.label), ["/grill", "/grill-me", "Cancel"]);
+    assert.deepEqual(agent.prompts, []);
+
+    await bridge.respondQuestion("/grill-me");
+    assert.deepEqual(agent.prompts, ["/grill-me"]);
+    assert.equal(bridge.state, "busy");
+  });
+});
+
+test("a command that takes arguments asks for them, and free text is accepted", async () => {
+  const id = "owned:cmd-args";
+  await commandBridge(id, async (bridge, agent) => {
+    await bridge.prompt("slash research");
+    await waitFor("the argument question", () => typesOf(id).includes("user_question"));
+    assert.match(lastQuestion(id).question, /<topic>/);
+    // The phone can answer with something no option offered — the directory step
+    // relies on exactly the same behaviour.
+    await bridge.respondQuestion("the auth flow");
+    assert.deepEqual(agent.prompts, ["/research the auth flow"]);
+  });
+
+  // Arguments supplied up front skip the question entirely.
+  await commandBridge("owned:cmd-args-inline", async (bridge, agent) => {
+    await bridge.prompt("slash research auth flow");
+    assert.deepEqual(agent.prompts, ["/research auth flow"]);
+  });
+});
+
+test("a destructive command is confirmed before it runs", async () => {
+  const id = "owned:cmd-confirm";
+  await commandBridge(id, async (bridge, agent) => {
+    await bridge.prompt("/compact");
+    await waitFor("the confirmation", () => typesOf(id).includes("user_question"));
+    assert.match(lastQuestion(id).question, /cannot be undone/);
+    assert.deepEqual(agent.prompts, []);
+
+    await bridge.respondQuestion("Run /compact");
+    assert.deepEqual(agent.prompts, ["/compact"]);
+  });
+});
+
+// A command question opens inside the turn `prompt()` started. Abandoning it must still
+// terminalize: `terminalizing`/`state` gate prompt() with a 409 and make interrupt() a
+// no-op, so a turn that never ends wedges the session for the life of the process.
+test("cancelling a command question ends the turn and leaves the session usable", async () => {
+  const id = "owned:cmd-cancel";
+  await commandBridge(id, async (bridge, agent) => {
+    await bridge.prompt("slash gril");
+    await waitFor("the picker", () => typesOf(id).includes("user_question"));
+
+    await bridge.respondQuestion("Cancel");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.prompts, []);
+    assert.ok(typesOf(id).includes("result"));
+
+    // The session still takes work — this is the whole point of the invariant.
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+});
+
+test("an unadvertised slash command still reaches the provider", async () => {
+  await commandBridge("owned:cmd-unknown", async (bridge, agent) => {
+    // Nothing is close enough to offer, so the provider reports its own unknown
+    // command rather than even-better inventing an error for it.
+    await bridge.prompt("slash zzzzz");
+    assert.deepEqual(agent.prompts, ["/zzzzz"]);
+  });
+});
+
+// A command question has no provider turn behind it, so agent.interrupt() finds nothing
+// active and returns a no-op. Without special handling the bridge stays busy forever —
+// and this is the only escape if a menu ever fails to render on the glasses.
+test("interrupting a command question releases the session", async () => {
+  const id = "owned:cmd-interrupt";
+  await commandBridge(id, async (bridge, agent) => {
+    await bridge.prompt("slash gril");
+    await waitFor("the picker", () => typesOf(id).includes("user_question"));
+
+    await bridge.interrupt();
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.prompts, []);
+
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+});
