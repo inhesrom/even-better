@@ -276,7 +276,10 @@ test("Claude start names its own session and never waits for a turn to begin", a
     assert.match(started.nativeSessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.deepEqual(fake.sessionIds, [started.nativeSessionId]);
     assert.deepEqual(fake.resumes, [undefined]);
-    assert.equal(sink.events.length, 0);
+    // Startup seeds the command list and nothing else. The invariant under test is
+    // that no `model` has arrived: it rides on system/init, which the CLI does not
+    // send until a turn begins, so waiting for it here would deadlock every launch.
+    assert.deepEqual(sink.events.map((event) => event.type), ["commands"]);
 
     // The model is late-bound: it lands with turn one.
     await agent.prompt("inspect");
@@ -373,4 +376,79 @@ test("Claude startup failure reports the child's stderr", async () => {
     (error: Error) =>
       /Claude startup timed out/.test(error.message) && /Invalid API key · Please run \/login/.test(error.message),
   );
+});
+
+/** A child that answers the handshake with `commands`, then replays whatever
+ *  system messages a test hands it once the first prompt arrives. */
+function commandQueryFactory(commands: unknown[], replay: unknown[]): typeof queryFunction {
+  return ((params: FactoryParams) => {
+    const stream = new MessageStream();
+    void (async () => {
+      for await (const _ of params.prompt as AsyncIterable<SDKUserMessage>) {
+        void _;
+        for (const message of replay) stream.push(sdkMessage(message));
+        stream.push(result(true));
+      }
+    })();
+    const handle = {
+      next: () => stream.next(),
+      return: async () => ({ done: true, value: undefined }),
+      throw: async (error: unknown) => { throw error; },
+      [Symbol.asyncIterator]() { return this; },
+      initializationResult: async () => ({
+        models: [], commands, agents: [], output_style: "", available_output_styles: [], account: {},
+      }) as unknown as SDKControlInitializeResponse,
+      interrupt: async () => undefined,
+      close: () => stream.close(),
+    };
+    return handle as unknown as Query;
+  }) as typeof queryFunction;
+}
+
+test("the command list is seeded from the handshake and replaced on change", async () => {
+  const sink = new Sink();
+  const agent = new ClaudeOwnedAgent(cwd, config, commandQueryFactory(
+    [{ name: "usage", description: "Show usage", argumentHint: "", aliases: ["cost"] }],
+    [{ type: "system", subtype: "commands_changed", commands: [
+      { name: "usage", description: "Show usage", argumentHint: "" },
+      { name: "grill-me", description: "Grill", argumentHint: "<topic>" },
+    ] }],
+  ));
+  try {
+    await agent.start(sink);
+    // An always-present empty argumentHint must not read as "takes arguments".
+    assert.deepEqual(agent.commands(), [
+      { name: "usage", description: "Show usage", aliases: ["cost"] },
+    ]);
+
+    await agent.prompt("/usage");
+    await waitFor(sink, "commands", 2);
+    // Skills appear as the agent moves around, so the push replaces rather than adds.
+    assert.deepEqual(agent.commands(), [
+      { name: "usage", description: "Show usage" },
+      { name: "grill-me", description: "Grill", argumentHint: "<topic>" },
+    ]);
+  } finally {
+    await agent.dispose();
+  }
+});
+
+test("local command output and compaction are visible on the glasses", async () => {
+  const sink = new Sink();
+  const agent = new ClaudeOwnedAgent(cwd, config, commandQueryFactory([], [
+    { type: "system", subtype: "local_command_output", content: "Session: 41,000 tokens" },
+    { type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "manual", pre_tokens: 41000, post_tokens: 9000 } },
+  ]));
+  try {
+    await agent.start(sink);
+    await agent.prompt("/usage");
+    // /usage bypasses the query loop entirely — this is its only output channel.
+    const prose = await waitFor(sink, "prose");
+    assert.equal(prose.type === "prose" && prose.text, "Session: 41,000 tokens");
+    const notice = await waitFor(sink, "notification");
+    assert.match(notice.type === "notification" ? notice.message : "", /41,000.*9,000/);
+    await waitFor(sink, "result");
+  } finally {
+    await agent.dispose();
+  }
 });

@@ -5,6 +5,7 @@ import { CodexOwnedAgent } from "./codex-owned-agent.js";
 import { GrokOwnedAgent } from "./grok-owned-agent.js";
 import type { GrokConfig } from "./grok-config.js";
 import type { OwnedAgent, OwnedAgentStartInfo } from "./owned-agent.js";
+import { parseAnswer } from "./owned-commands.js";
 import type { OwnedConfig, OwnedProviderConfig } from "./owned-config.js";
 import { OwnedSessionBridge } from "./owned-session-bridge.js";
 import {
@@ -42,20 +43,6 @@ function defaultAgentFactory(provider: ProviderId, cwd: string, config: OwnedPro
 
 function providerLabel(provider: ProviderId): string {
   return provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : "Grok";
-}
-
-function parseAnswer(answer: string): string {
-  try {
-    const parsed = JSON.parse(answer) as unknown;
-    if (typeof parsed === "string") return parsed;
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-      const value = Object.values(parsed as Record<string, unknown>)[0];
-      if (typeof value === "string") return value;
-    }
-  } catch {
-    // The phone commonly sends a plain option label.
-  }
-  return answer;
 }
 
 function compactPrompt(prompt: string, limit = 56): string {

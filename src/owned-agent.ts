@@ -21,8 +21,19 @@ export interface OwnedUsage {
   turns: number;
 }
 
+/** One provider-native slash command. `name` never carries the leading slash, so
+ *  matching and display do not have to agree on whether it is there. */
+export interface OwnedCommand {
+  name: string;
+  description: string;
+  /** Present when the command takes arguments — the glasses ask for them. */
+  argumentHint?: string;
+  aliases?: string[];
+}
+
 export type OwnedAgentEvent =
   | { type: "model"; model: string }
+  | { type: "commands"; commands: OwnedCommand[] }
   | { type: "prose"; text: string }
   | {
       type: "tool";
@@ -69,6 +80,10 @@ export interface OwnedAgent {
   readonly cwd: string;
   start(sink: OwnedAgentSink, nativeSessionId?: string): Promise<OwnedAgentStartInfo>;
   prompt(text: string): Promise<void>;
+  /** Optional capability, like `Multiplexer.explain()`: providers with no command
+   *  surface (Codex's app-server) simply do not implement it. Executing a command
+   *  stays `prompt("/name args")` — only enumeration needs a seam. */
+  commands?(): OwnedCommand[];
   respondPermission(decision: string): Promise<void>;
   respondQuestion(answer: string): Promise<void>;
   interrupt(): Promise<void>;

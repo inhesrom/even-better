@@ -409,3 +409,65 @@ test("a failed provider start reopens as one retry, never the whole wizard", asy
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+// End-to-end over the real HTTP + SSE surface: a spoken command must reach the
+// provider as its slash form, and an ambiguous one must come back as a menu the
+// phone can answer. The bridge unit tests cover the state machine; this covers the
+// wiring from POST /prompt through the catalog to the wire.
+test("a spoken slash command dispatches, and an ambiguous one asks first", async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "even-better-owned-commands-"));
+  const home = path.join(workspace, ".even-better-state");
+  const child = startServer(workspace, home);
+  try {
+    const base = await waitForServer(child);
+    const sessionId = await newSessionPrompt(base, "first prompt");
+    await firstSseEvent(base, sessionId);
+    await answer(base, sessionId, "Grok");
+    await waitForMessage(base, sessionId, "user_question", 2);
+    await answer(base, sessionId, workspace);
+    // The first prompt runs once the provider is up, and the fixture blocks it on a
+    // permission and a question before finishing. Clear both so the session is idle.
+    await waitForMessage(base, sessionId, "permission_request");
+    await api(base, "/permission-response", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, decision: "allow" }),
+    });
+    // Three so far: the provider question, the directory question, and the fixture's.
+    await waitForMessage(base, sessionId, "user_question", 3);
+    await answer(base, sessionId, "Deep");
+    await waitForMessage(base, sessionId, "result");
+
+    const stream = await openStream(base, sessionId);
+    try {
+      await api(base, "/prompt", {
+        method: "POST",
+        body: JSON.stringify({ sessionId, text: "slash gril" }),
+      }, 202);
+      // "gril" prefixes both /grill and /grill-me, so nothing may be dispatched yet.
+      await waitFor("the command picker", () => asked(stream, "pick") === 1);
+      const picker = stream.events.find((message) => message.toolUseId?.endsWith(":pick"));
+      assert.match(picker?.toolUseId ?? "", /^owned-command:/);
+
+      await answer(base, sessionId, "/grill-me");
+      // Picking dispatches inside the turn the prompt already opened, so the fixture's
+      // ordinary turn script runs and one result closes the whole interaction.
+      await waitFor("the command turn to start", () =>
+        stream.events.some((message) => message.type === "permission_request"));
+      await api(base, "/permission-response", {
+        method: "POST",
+        body: JSON.stringify({ sessionId, decision: "allow" }),
+      });
+      await waitFor("the provider's own question", () =>
+        stream.events.filter((message) => message.type === "user_question").length === 2);
+      await answer(base, sessionId, "Deep");
+      await waitFor("the command turn to close", () => stream.events.some((message) => message.type === "result"));
+      assert.equal(stream.events.filter((message) => message.type === "result").length, 1);
+      assert.equal(stream.ended, false);
+    } finally {
+      stream.close();
+    }
+  } finally {
+    await stop(child);
+    await rm(workspace, { recursive: true, force: true });
+  }
+});

@@ -33,6 +33,9 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   echo suppression) live here and nowhere else.
 - **`render.ts`** — pure `string→string` glasses transforms (table reflow, box
   strip). Applied before emit.
+- **`owned-commands.ts`** — pure matching of spoken/typed input against the
+  provider's advertised command list. Every heuristic for "which command did they
+  mean" lives here, the way screen artifacts live in `screen-timeline.ts`.
 - **`multiplexer.ts`** — the `Multiplexer` seam (pane I/O) + normalized
   `PaneStatus`. `index.ts` picks one backend at boot (`MUX` env, else auto) and
   everything reads it via `getMux()`. Status is normalized here so the bridge's
@@ -210,6 +213,22 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   synchronous session-store writes) must run through `persist()`. An ENOSPC there
   otherwise skips `result` + `status: idle` and wedges the session until restart —
   losing a history line is the acceptable failure.
+- **A command question opens a turn that has not reached the provider.** The
+  picker/args/confirm menus are emitted inside the turn `prompt()` started, so
+  every exit must terminalize: Cancel is on every question, and `interrupt()`
+  special-cases them because `agent.interrupt()` finds no active turn and returns
+  a no-op, leaving the session busy with nothing running. Sitting inside the turn
+  is also what makes the menu wire-identical to a provider question — ADR 0004
+  established that the app ignores a question the user's prompt did not trigger.
+- **Commands are enumerated, never invented.** `OwnedAgent.commands()` is an
+  optional capability (like `Multiplexer.explain()`) and execution is passthrough
+  — `prompt("/name args")`, which Claude and Grok parse themselves. Codex
+  advertises nothing, so its prompts must stay byte-identical to the pre-command
+  path. All matching lives in `owned-commands.ts` and never in an adapter.
+- **Claude's local commands need their own message cases.** `/usage`, `/cost` and
+  `/context` bypass the query loop entirely and emit only
+  `system/local_command_output`; `/compact` emits only `compact_boundary`.
+  Dropping those (as `onMessage` did) makes the command run and show nothing.
 - **Idle is debounced (`IDLE_GRACE_MS`).** herdr flips to idle transiently
   between tool calls (its prompt box flashes), so committing immediately blanks
   the thinking indicator and fires a spurious `result` mid-turn. Only commit
