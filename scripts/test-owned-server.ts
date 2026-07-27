@@ -27,15 +27,25 @@ interface WireMessage {
   provider?: string;
   agentProvider?: string;
   toolUseId?: string;
+  title?: string;
 }
 
 /** Exactly one wizard row is always offered so agent and directory can be chosen
  *  before any prompt exists. Setup rows carry no `agentProvider`. */
+const MANAGE_TITLE = "＋ Manage sessions";
+
+/** Setup rows only. The manage row is synthetic too, so it also has no
+ *  `agentProvider`, but it is never a way into the wizard. */
 function assertOneWizardRow(sessions: SessionItem[], title?: string): void {
-  const wizard = sessions.filter((session) => session.agentProvider === undefined);
+  const wizard = sessions.filter(
+    (session) => session.agentProvider === undefined && session.title !== MANAGE_TITLE,
+  );
   assert.equal(wizard.length, 1, `expected one wizard row, got ${JSON.stringify(sessions.map((s) => s.title))}`);
   if (title !== undefined) assert.equal(wizard[0]?.title, title);
 }
+
+const manageRow = (sessions: SessionItem[]): SessionItem | undefined =>
+  sessions.find((session) => session.title === MANAGE_TITLE);
 
 const agentRows = (sessions: SessionItem[]): SessionItem[] =>
   sessions.filter((session) => session.agentProvider !== undefined);
@@ -191,13 +201,15 @@ async function waitFor(what: string, ready: () => boolean): Promise<void> {
 const asked = (stream: OpenStream, step: string): number =>
   stream.events.filter((message) => message.toolUseId?.endsWith(`:${step}`)).length;
 
-/** ADR 0005: the wizard's first question must not arrive in the same frame as the
- *  stream opening — the app silently drops it, which is what ADR 0004 measured and
- *  mistook for "rows cannot host a menu". The prime goes first, the question follows. */
-async function assertPrimedQuestion(base: string, id: string): Promise<void> {
+/** ADR 0005: a synthetic row's first question must not arrive in the same frame as
+ *  the stream opening — the app silently drops it, which is what ADR 0004 measured
+ *  and mistook for "rows cannot host a menu". The prime goes first, the question
+ *  follows. Both the wizard and the manage row depend on this, so `step` names
+ *  which one is under test. */
+async function assertPrimedQuestion(base: string, id: string, step = "provider"): Promise<void> {
   const stream = await openStream(base, id);
   try {
-    await waitFor("the primed agent question", () => asked(stream, "provider") >= 1);
+    await waitFor(`the primed ${step} question`, () => asked(stream, step) >= 1);
     const types = stream.events.map((event) => event.type);
     assert.equal(types[0], "user_prompt", `expected the prime first, got ${types.join(", ")}`);
     assert.ok(
@@ -516,6 +528,77 @@ test("a spoken slash command dispatches, and an ambiguous one asks first", async
     } finally {
       stream.close();
     }
+  } finally {
+    await stop(child);
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("the manage row deletes a remembered session over SSE, and DELETE does the same", async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "even-better-owned-manage-"));
+  const home = path.join(workspace, ".even-better-state");
+  const child = startServer(workspace, home);
+  try {
+    const base = await waitForServer(child);
+
+    // Nothing remembered yet, so there is nothing to manage.
+    const empty = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    assert.equal(manageRow(empty.sessions), undefined);
+
+    const doomed = await newSessionPrompt(base, "delete me");
+    await answer(base, doomed, "Grok");
+    await answer(base, doomed, workspace);
+    await waitForMessage(base, doomed, "status", 1);
+
+    const listed = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    const manager = manageRow(listed.sessions);
+    assert.ok(manager, `expected a manage row, got ${JSON.stringify(listed.sessions.map((s) => s.title))}`);
+    // The manage row is the wizard's twin: same prime, same deferral, same guard.
+    await assertPrimedQuestion(base, manager.id, "pick");
+
+    const stream = await openStream(base, manager.id);
+    try {
+      await waitFor("the delete menu", () => asked(stream, "pick") >= 1);
+      const pick = stream.events.find((event) => event.toolUseId?.endsWith(":pick")) as
+        | { questions?: Array<{ options: Array<{ label: string }> }> }
+        | undefined;
+      const label = pick?.questions?.[0]?.options[0]?.label;
+      assert.ok(label, "expected a session option");
+
+      await answer(base, manager.id, label);
+      await waitFor("the confirm menu", () => asked(stream, "confirm") >= 1);
+      await answer(base, manager.id, "Delete forever");
+      await waitFor(
+        "the deletion notification",
+        () => stream.events.some((event) => event.title === "Session deleted"),
+      );
+    } finally {
+      stream.close();
+    }
+
+    const afterDelete = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    assert.deepEqual(agentRows(afterDelete.sessions), []);
+    // Gone from the catalog entirely, not just from the list.
+    await api<{ error: string }>(base, `/sessions/${encodeURIComponent(doomed)}/history`, {}, 404);
+
+    // The same catalog.forget() path, reached over HTTP instead of the glasses.
+    const second = await newSessionPrompt(base, "delete me too");
+    await answer(base, second, "Grok");
+    await answer(base, second, workspace);
+    await waitForMessage(base, second, "status", 1);
+    const watching = await openStream(base, second);
+    try {
+      await api(base, `/sessions/${encodeURIComponent(second)}`, { method: "DELETE" });
+      // dropSession() ends the phone's stream; that is user-visible, so assert it.
+      await waitFor("the deleted session's stream to end", () => watching.ended);
+    } finally {
+      watching.close();
+    }
+    const afterHttp = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    assert.deepEqual(agentRows(afterHttp.sessions), []);
+
+    const missing = await api<{ error: string }>(base, "/sessions/owned:00000000-0000-4000-8000-000000000000", { method: "DELETE" }, 404);
+    assert.match(missing.error, /not found/i);
   } finally {
     await stop(child);
     await rm(workspace, { recursive: true, force: true });

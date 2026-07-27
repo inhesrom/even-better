@@ -30,6 +30,7 @@ function config(homeDir: string, maxSessions = 6, directoryLimit = 0): OwnedConf
     homeDir,
     maxSessions,
     directoryLimit,
+    manageSessionLimit: 4,
     // The real delay exists only to survive the app's renderer; settle() covers the
     // one tick setTimeout(0) still costs.
     setupQuestionDelayMs: 0,
@@ -157,8 +158,39 @@ const notified = (session: LiveSession, title: string): boolean =>
 const agentRows = (items: SessionDescriptor[]): SessionDescriptor[] =>
   items.filter((item) => item.agentProvider !== undefined);
 
+const MANAGE_TITLE = "＋ Manage sessions";
+
+/** Setup rows only. The manage row is synthetic too, so it shares the missing
+ *  `agentProvider`, but it is never a way into the wizard. */
 const wizardRows = (items: SessionDescriptor[]): SessionDescriptor[] =>
-  items.filter((item) => item.agentProvider === undefined);
+  items.filter((item) => item.agentProvider === undefined && item.title !== MANAGE_TITLE);
+
+const manageRow = (items: SessionDescriptor[]): SessionDescriptor | undefined =>
+  items.find((item) => item.title === MANAGE_TITLE);
+
+/** The manage row through the catalog, as the phone reaches it: list, then get. */
+async function openManager(catalog: OwnedSessionCatalog): Promise<LiveSession> {
+  const row = manageRow(await catalog.list());
+  assert.ok(row, "expected a manage row");
+  const session = await catalog.get(row.id);
+  assert.ok(session);
+  await session.onConnect?.();
+  session.replayPending?.();
+  await settle(() => asked(session, "pick") >= 1);
+  return session;
+}
+
+/** The ordinal label the manage menu showed for `sessionId`. */
+function pickLabel(manager: LiveSession, sessionId: string, catalog: OwnedSessionCatalog): string {
+  const index = catalog.deletable().findIndex((session) => session.id === sessionId);
+  assert.ok(index >= 0, "expected the session to be deletable");
+  const wire = getMessages(manager.id, 0)
+    .filter((message) => (message as { toolUseId?: string }).toolUseId?.endsWith(":pick"))
+    .at(-1) as { questions?: Array<{ options: Array<{ label: string }> }> } | undefined;
+  const label = wire?.questions?.[0]?.options[index]?.label;
+  assert.ok(label, "expected a menu option for the session");
+  return label;
+}
 
 test("an openable wizard row exists before any prompt and adopts one when it arrives", async () => {
   const home = path.join(scratch, "state-prompt-setup");
@@ -238,8 +270,10 @@ test("a restarted setup reuses its public id instead of dropping the phone's str
     const live = await setup(catalog, "codex", "keep me");
     await beginSetup(catalog, "another abandoned");
     const after = await catalog.list();
-    assert.equal(after.length, 2);
-    assert.ok(after.some((item) => item.id === live.id));
+    assert.equal(wizardRows(after).length, 1);
+    assert.deepEqual(agentRows(after).map((item) => item.id), [live.id]);
+    // Something is remembered now, so the manage row has joined them.
+    assert.ok(manageRow(after));
   } finally {
     await catalog.dispose();
   }
@@ -536,6 +570,226 @@ test("resume failures keep remembered metadata and local history", async () => {
     assert.deepEqual(await remembered.history?.(), [{ role: "user", text: "remember me" }]);
     assert.ok(getMessages(record.id, 0).some((message) => (message as { title?: string }).title === "Codex session could not resume"));
     assert.ok(store.get(record.id));
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the manage row appears only once something is remembered, and sorts after the wizard", async () => {
+  const home = path.join(scratch, "state-manage-visibility");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  try {
+    // A fresh install has nothing to manage, so the row would only be a dead end.
+    const empty = await catalog.list();
+    assert.equal(manageRow(empty), undefined);
+    assert.equal(empty.length, 1);
+
+    await setup(catalog, "claude");
+    const listed = await catalog.list();
+    assert.ok(manageRow(listed));
+    // Wizard first, manager second, remembered rows after: fixed here rather than
+    // left to Map order surviving the sort, so the top of the list is stable.
+    assert.equal(listed[0]?.title, "＋ Agent setup");
+    assert.equal(listed[1]?.title, MANAGE_TITLE);
+    assert.equal(listed[2]?.agentProvider, "claude");
+    assert.equal(manageRow(listed)?.status, "awaiting");
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the manage row deletes a remembered session and re-arms its menu", async () => {
+  const home = path.join(scratch, "state-manage-delete");
+  const agents: FakeAgent[] = [];
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents));
+  const store = new OwnedSessionStore(home);
+  try {
+    const doomed = await setup(catalog, "claude", "delete me");
+    const kept = await setup(catalog, "grok", "keep me");
+    const directory = path.join(home, "sessions", doomed.id.replace("owned:", ""));
+    assert.ok(fs.existsSync(directory));
+
+    const manager = await openManager(catalog);
+    await manager.respondQuestion(pickLabel(manager, doomed.id, catalog));
+    assert.equal(asked(manager, "confirm"), 1);
+
+    await manager.respondQuestion("Delete forever");
+    await settle(() => store.list().length === 1);
+
+    assert.equal(store.get(doomed.id), undefined);
+    assert.equal(fs.existsSync(directory), false, "the session directory should be gone");
+    assert.equal(await catalog.get(doomed.id), undefined);
+    assert.deepEqual(agentRows(await catalog.list()).map((row) => row.id), [kept.id]);
+    // Its child is stopped, not just forgotten.
+    assert.equal(agents[0]?.disposed, 1);
+    assert.ok(notified(manager, "Session deleted"));
+    // The row stays usable for a second delete.
+    await settle(() => asked(manager, "pick") >= 2);
+
+    // Nothing recreates the directory afterwards: save()/appendHistory() would
+    // mkdir it back, and a late activity hook is exactly how that happened.
+    await settle();
+    assert.equal(fs.existsSync(directory), false);
+    assert.equal(store.get(doomed.id), undefined);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the manage row keeps a session on Keep, on Cancel, and on an unrecognized answer", async () => {
+  const home = path.join(scratch, "state-manage-keep");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  const store = new OwnedSessionStore(home);
+  try {
+    const session = await setup(catalog, "codex", "keep me");
+    const manager = await openManager(catalog);
+
+    await manager.respondQuestion(pickLabel(manager, session.id, catalog));
+    await manager.respondQuestion("Keep");
+    assert.equal(store.list().length, 1);
+    assert.equal(asked(manager, "pick"), 2);
+
+    // The literal index.ts substitutes for an empty answer body must never delete.
+    await manager.respondQuestion(pickLabel(manager, session.id, catalog));
+    await manager.respondQuestion("skip");
+    assert.equal(store.list().length, 1);
+    assert.ok(notified(manager, "Choose an option"));
+    assert.equal(asked(manager, "confirm"), 3);
+
+    await manager.respondQuestion("Keep");
+    await manager.respondQuestion("Cancel");
+    assert.equal(store.list().length, 1);
+    assert.ok(notified(manager, "Nothing deleted"));
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the manage row deletes a busy session and stops its child", async () => {
+  const home = path.join(scratch, "state-manage-busy");
+  const agents: FakeAgent[] = [];
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents));
+  const store = new OwnedSessionStore(home);
+  try {
+    const session = await setup(catalog, "grok", "busy one");
+    await session.prompt("hang");
+    assert.equal(session.state, "busy");
+
+    const manager = await openManager(catalog);
+    await manager.respondQuestion(pickLabel(manager, session.id, catalog));
+    await manager.respondQuestion("Delete forever");
+    await settle(() => store.list().length === 0);
+
+    // Unlike LRU eviction, which never takes a busy row, this interrupts and tears
+    // the child down rather than refusing.
+    assert.equal(agents[0]?.disposed, 1);
+    assert.equal(await catalog.get(session.id), undefined);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the last delete leaves the row in place, saying there is nothing left", async () => {
+  const home = path.join(scratch, "state-manage-empty");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  const store = new OwnedSessionStore(home);
+  try {
+    const session = await setup(catalog, "claude", "only one");
+    const manager = await openManager(catalog);
+    await manager.respondQuestion(pickLabel(manager, session.id, catalog));
+    await manager.respondQuestion("Delete forever");
+    await settle(() => store.list().length === 0);
+    await settle(() => notified(manager, "No sessions to delete"));
+
+    // Disposing it would res.end() the phone's stream with no notification, so the
+    // row survives with an explanation instead of vanishing mid-use.
+    assert.ok(manageRow(await catalog.list()));
+    assert.equal(asked(manager, "pick"), 1, "an empty menu must not be re-emitted");
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the manage row refuses prompts and is not itself deletable", async () => {
+  const home = path.join(scratch, "state-manage-guards");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  try {
+    await setup(catalog, "claude", "something");
+    const manager = await openManager(catalog);
+    await assert.rejects(manager.prompt("do a thing"), /only removes sessions/);
+    // A ＋ New Session prompt must still land on the wizard, not here.
+    const created = await catalog.default();
+    assert.notEqual(created?.id, manager.id);
+
+    await assert.rejects(catalog.forget(manager.id), /Session not found/);
+    const wizard = wizardRows(await catalog.list())[0];
+    assert.ok(wizard);
+    await assert.rejects(catalog.forget(wizard.id), /not a remembered session/);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the confirm question names the exact row when two sessions share a directory", async () => {
+  const home = path.join(scratch, "state-manage-ambiguous");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  try {
+    // Same provider, same cwd: the short menu label is identical for both, so the
+    // confirm has to carry the prompt excerpt or it asks "delete which one?" about
+    // something irreversible.
+    await setup(catalog, "claude", "first task");
+    await setup(catalog, "claude", "second task");
+    const manager = await openManager(catalog);
+    const oldest = catalog.deletable()[0];
+    assert.ok(oldest);
+
+    await manager.respondQuestion(pickLabel(manager, oldest.id, catalog));
+    const confirm = getMessages(manager.id, 0)
+      .filter((message) => (message as { toolUseId?: string }).toolUseId?.endsWith(":confirm"))
+      .at(-1) as { questions?: Array<{ question: string }> } | undefined;
+    assert.match(confirm?.questions?.[0]?.question ?? "", /first task/);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("the delete menu pages instead of growing past what the glasses render", async () => {
+  const home = path.join(scratch, "state-manage-paging");
+  const catalog = new OwnedSessionCatalog(config(home), factory([]));
+  try {
+    // Eleven options did not render on a physical phone, so the menu is capped and
+    // pages; recent sessions must stay reachable under that cap.
+    for (let index = 0; index < 6; index++) await setup(catalog, "claude", `task ${index}`);
+    const manager = await openManager(catalog);
+
+    const options = (): Array<{ label: string }> => {
+      const wire = getMessages(manager.id, 0)
+        .filter((message) => (message as { toolUseId?: string }).toolUseId?.endsWith(":pick"))
+        .at(-1) as { questions?: Array<{ options: Array<{ label: string }> }> } | undefined;
+      return wire?.questions?.[0]?.options ?? [];
+    };
+
+    // Four sessions + More + Cancel.
+    assert.equal(options().length, 6);
+    assert.equal(options().at(-1)?.label, "Cancel");
+    assert.equal(options().at(-2)?.label, "More sessions…");
+    assert.ok(options()[0]?.label.startsWith("1 · "));
+
+    await manager.respondQuestion("More sessions…");
+    // The tail page: two sessions, no More, ordinals continue rather than restart.
+    assert.equal(options().length, 3);
+    assert.equal(options()[0]?.label.startsWith("5 · "), true);
+    assert.equal(options().at(-1)?.label, "Cancel");
+
+    // The newest session is reachable on that page, which is the point of paging.
+    const newest = catalog.deletable().at(-1);
+    assert.ok(newest);
+    await manager.respondQuestion(options()[1]!.label);
+    await manager.respondQuestion("Delete forever");
+    await settle(() => catalog.deletable().length === 5);
+    assert.equal(await catalog.get(newest.id), undefined);
+    // After a delete the list shifted, so paging restarts at the oldest.
+    assert.ok(options()[0]?.label.startsWith("1 · "));
   } finally {
     await catalog.dispose();
   }

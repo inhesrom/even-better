@@ -114,8 +114,9 @@ Everything is optional — `even-better` works with no flags.
 | `MUX` | auto | Multiplexer backend: `herdr` or `cmux`. Auto-detects; if both are present, prompts on a TTY (set this to choose) |
 | `WORKSPACE_ROOTS` | launch cwd | Platform-delimited approved absolute roots; explicit values replace the cwd default |
 | `EVEN_BETTER_HOME` | platform state directory | Override durable owned-session metadata/history storage |
-| `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped |
+| `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped — delete them from the ＋ Manage sessions row or `even-better sessions remove` |
 | `WIZARD_DIRECTORY_LIMIT` | `0` | Options in the wizard's directory question; `0` offers every eligible directory |
+| `MANAGE_SESSION_LIMIT` | `4` | Sessions per page in the ＋ Manage sessions delete question. Unlike the directory question this has no unlimited: an eleven-option menu did not render on a physical phone, so the menu always pages |
 | `SETUP_QUESTION_DELAY_MS` | `500` | Delay before the wizard's first question after a stream opens; the app drops one sent in the same tick (ADR 0005) |
 | `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
 | `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |

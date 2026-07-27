@@ -60,6 +60,8 @@ Owned mode's catalog, in more detail:
 ```text
 OwnedSessionCatalog
   ├─ one wizard row (＋ Agent setup; openable before any prompt exists)
+  ├─ one manage row (＋ Manage sessions; appears once something is remembered)
+  │    └─ catalog.forget(id) — dispose, drop, then OwnedSessionStore.remove
   └─ remembered sessions (metadata + display history; lazily attached)
        └─ OwnedSessionBridge (wire events, pacing, interaction state)
             └─ OwnedAgent

@@ -478,6 +478,22 @@ api.get("/sessions/:id/history", async (req, res) => {
   }
 });
 
+// Not part of the stock even-terminal protocol — the app never calls it. It
+// exists so the sim and the server tests drive the same catalog.forget() path
+// the glasses' manage row uses.
+api.delete("/sessions/:id", async (req, res) => {
+  if (!catalog.forget) {
+    res.status(405).json({ error: "This source cannot forget sessions." });
+    return;
+  }
+  try {
+    await catalog.forget(req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    controlError(res, err);
+  }
+});
+
 // ── startup ────────────────────────────────────────────
 
 // An IPv4 in 100.64.0.0/10 is Tailscale's CGNAT range — reachable from any

@@ -175,15 +175,40 @@ bounded deadlines, and releases catalog leases without forgetting sessions.
 
 ## Session management
 
+From the glasses, the **＋ Manage sessions** row appears in the list once at least
+one session is remembered, directly after the wizard row. It asks which session
+to delete — oldest first, labelled `<n> · Agent · folder` with its age and
+first-prompt excerpt — then confirms with **Delete forever** / **Keep**.
+
+The menu shows `MANAGE_SESSION_LIMIT` sessions at a time (default 4) and offers
+**More sessions…** when others remain; ordinals continue across pages, so a
+recent session is still reachable. This has no unlimited setting: an eleven-option
+menu did not render at all on a physical phone — the row simply sat awaiting an
+answer to a menu that was never drawn. After a delete the list has shifted, so
+paging restarts at the oldest.
+
+The row only removes sessions: prompting it returns `409`, and ＋ New
+Session still lands on the wizard. A busy session is interrupted and its agent
+stopped rather than refused, unlike the attached-process eviction below. Deleting
+the last session leaves the row in place saying so, because dropping it would end
+the phone's stream mid-use.
+
+`DELETE /api/sessions/:id` reaches the same code path. The stock app never sends
+it; it exists so `pnpm sim` (the `d` key in the picker) and the server tests can
+drive deletion without hardware.
+
+From a terminal:
+
 ```bash
 even-better sessions
 even-better sessions remove <public-id>
 even-better sessions clear
 ```
 
-These commands remove only even-better metadata/history. Native Claude, Codex,
-and Grok transcripts are untouched. Removal is refused while a running server
-leases a target row; stop the owning server first.
+Every route removes only even-better metadata/history. Native Claude, Codex, and
+Grok transcripts are untouched. The CLI's removal is refused while a running
+server leases a target row — stop the owning server first; the glasses row and
+the HTTP verb release that lease themselves.
 
 ## Verification
 

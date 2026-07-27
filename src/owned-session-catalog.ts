@@ -7,6 +7,9 @@ import type { GrokConfig } from "./grok-config.js";
 import type { OwnedAgent, OwnedAgentStartInfo } from "./owned-agent.js";
 import { parseAnswer } from "./owned-commands.js";
 import type { OwnedConfig, OwnedProviderConfig } from "./owned-config.js";
+import { compactPrompt, providerLabel } from "./owned-format.js";
+import { OwnedManageSession } from "./owned-manage-session.js";
+import { deferRowQuestion, primeRow } from "./owned-row-question.js";
 import { OwnedSessionBridge } from "./owned-session-bridge.js";
 import {
   OwnedSessionStore,
@@ -41,27 +44,8 @@ function defaultAgentFactory(provider: ProviderId, cwd: string, config: OwnedPro
   return new GrokOwnedAgent(grok);
 }
 
-function providerLabel(provider: ProviderId): string {
-  return provider === "claude" ? "Claude" : provider === "codex" ? "Codex" : "Grok";
-}
-
-function compactPrompt(prompt: string, limit = 56): string {
-  const normalized = prompt.replace(/\s+/g, " ").trim();
-  const points = [...normalized];
-  return points.length > limit ? `${points.slice(0, limit).join("")}…` : normalized;
-}
-
-/** The prime that makes the stock app render the wizard's first question.
- *
- *  ADR 0004 measured that the app ignored a `user_question` emitted when a
- *  server-authored row opened, and concluded such rows could not host a menu.
- *  ADR 0005 measured *why*: the question must not arrive in the same tick as the
- *  stream opening, and the stream must first carry something that looks like a
- *  turn. A `user_prompt` followed by the question one delay later renders and is
- *  answerable on a physical phone; the same payload sent synchronously is dropped.
- *
- *  Only the first question needs this. Answers emit their follow-up question
- *  synchronously and the app renders those fine. */
+/** The prime text for the wizard row; see `owned-row-question.ts` for why either
+ *  row needs one at all. */
 const SETUP_PRIME_TEXT = "New agent session";
 
 /** Which wizard question is outstanding. Tracked explicitly because the retry step
@@ -146,6 +130,10 @@ class OwnedCatalogSession implements LiveSession {
     return this.releaseLease !== null;
   }
 
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   /** A setup session still in the wizard: no provider started, none starting. */
   get isPendingSetup(): boolean {
     return this.setup !== null && !this.setup.starting;
@@ -157,6 +145,22 @@ class OwnedCatalogSession implements LiveSession {
 
   get lastUsedMs(): number {
     return this.record ? Date.parse(this.record.lastUsedAt) : Number.MAX_SAFE_INTEGER;
+  }
+
+  /** Absent on a session whose wizard finished before any prompt was spoken —
+   *  ordinary since ADR 0005, so callers must handle the empty case. */
+  get firstPrompt(): string | undefined {
+    return this.record?.firstPrompt;
+  }
+
+  /** How this session reads in the phone's list. The manage row's confirm question
+   *  names it with exactly this string: two sessions can share a provider and a
+   *  directory, so dropping the prompt excerpt there would ask "delete which one?"
+   *  about a destructive, unconfirmable action. */
+  get rowTitle(): string {
+    if (!this.record) return this.setupTitle();
+    const prompt = this.record.firstPrompt ? compactPrompt(this.record.firstPrompt) : "";
+    return `${providerLabel(this.record.agentProvider)} · ${path.basename(this.record.cwd || "/")}${prompt ? ` · ${prompt}` : ""}`;
   }
 
   describe(): Promise<SessionDescriptor> {
@@ -171,10 +175,9 @@ class OwnedCatalogSession implements LiveSession {
         model: "Unknown",
       });
     }
-    const prompt = this.record.firstPrompt ? compactPrompt(this.record.firstPrompt) : "";
     return Promise.resolve({
       id: this.id,
-      title: `${providerLabel(this.record.agentProvider)} · ${path.basename(this.record.cwd || "/")}${prompt ? ` · ${prompt}` : ""}`,
+      title: this.rowTitle,
       timestamp: this.record.lastUsedAt,
       cwd: this.record.cwd,
       provider: "codex",
@@ -198,6 +201,9 @@ class OwnedCatalogSession implements LiveSession {
   }
 
   async prompt(text: string): Promise<void> {
+    // appendHistory() below runs before ensureAttached() and would mkdir the
+    // session directory back — see save().
+    if (this.disposed) throw new SessionControlError("This session was deleted.", 409);
     if (this.setup) {
       if (this.setup.firstPrompt !== null) {
         throw new SessionControlError(
@@ -260,9 +266,9 @@ class OwnedCatalogSession implements LiveSession {
         if (provider) this.notify(`Starting ${providerLabel(provider)}…`, "The agent is still starting.");
         return;
       }
-      // See SETUP_PRIME_TEXT: without this the app drops the question that
-      // replayPending() is about to schedule.
-      emit(this.id, { type: "user_prompt", text: SETUP_PRIME_TEXT });
+      // Without this the app drops the question replayPending() is about to
+      // schedule — see owned-row-question.ts.
+      primeRow(this.id, SETUP_PRIME_TEXT);
       // Exhaustive on purpose: an if/else chain mapped every unlisted step to the
       // retry menu, so a new step would silently replay the wrong question.
       switch (this.setup.step) {
@@ -303,16 +309,16 @@ class OwnedCatalogSession implements LiveSession {
   replayPending(): void {
     if (this.setup) {
       if (this.setup.starting) return;
-      const wire = this.setup.pendingWire;
-      // Deferred, not synchronous: see SETUP_PRIME_TEXT. index.ts pushes its status
-      // snapshot between the prime and this, which is the order measured to work.
+      // Deferred, not synchronous: see owned-row-question.ts. index.ts pushes its
+      // status snapshot between the prime and this, which is the order measured
+      // to work.
       clearTimeout(this.questionTimer ?? undefined);
-      this.questionTimer = setTimeout(() => {
-        this.questionTimer = null;
-        if (this.setup && !this.setup.starting) emit(this.id, wire);
-      }, this.catalog.config.setupQuestionDelayMs);
-      // A wizard nobody answers must not be why the process cannot exit.
-      this.questionTimer.unref();
+      this.questionTimer = deferRowQuestion(
+        this.id,
+        this.setup.pendingWire,
+        this.catalog.config.setupQuestionDelayMs,
+        () => this.setup !== null && !this.setup.starting,
+      );
       return;
     }
     this.bridge?.replayPending();
@@ -381,7 +387,7 @@ class OwnedCatalogSession implements LiveSession {
   }
 
   onAssistant(text: string): void {
-    if (!this.record || !text.trim()) return;
+    if (this.disposed || !this.record || !text.trim()) return;
     this.catalog.store.appendHistory(this.id, {
       role: "assistant",
       text: text.trim(),
@@ -641,8 +647,13 @@ class OwnedCatalogSession implements LiveSession {
     }
   }
 
+  /** Every persisting path funnels through here, including touch(). The disposed
+   *  check is what keeps a deleted session deleted: `store.save()` calls
+   *  `ensureSessionDirectory`, which recreates the directory `forget()` just
+   *  removed — a resume or a late `activity` hook racing the delete would
+   *  otherwise resurrect a half-empty row that comes back on the next restart. */
   private save(updateTimestamp: boolean): void {
-    if (!this.record) return;
+    if (this.disposed || !this.record) return;
     if (updateTimestamp) this.record.updatedAt = new Date().toISOString();
     this.catalog.store.save(this.record);
   }
@@ -667,6 +678,7 @@ class OwnedCatalogSession implements LiveSession {
 export class OwnedSessionCatalog implements SessionCatalog {
   readonly store: OwnedSessionStore;
   private readonly sessions = new Map<string, OwnedCatalogSession>();
+  private manager: OwnedManageSession | null = null;
   private disposed = false;
   private attachmentTail: Promise<void> = Promise.resolve();
 
@@ -691,17 +703,64 @@ export class OwnedSessionCatalog implements SessionCatalog {
 
   async list(): Promise<SessionDescriptor[]> {
     this.ensureLauncher();
+    this.ensureManager();
     const sessions = [...this.sessions.values()];
     sessions.sort((a, b) => {
       if (a.agentProvider === undefined && b.agentProvider !== undefined) return -1;
       if (a.agentProvider !== undefined && b.agentProvider === undefined) return 1;
       return b.lastUsedMs - a.lastUsedMs;
     });
-    return Promise.all(sessions.map((session) => session.describe()));
+    const rows = await Promise.all(sessions.map((session) => session.describe()));
+    // Both synthetic rows sort ahead of remembered ones; between themselves the
+    // order is fixed here rather than left to Map insertion surviving the sort,
+    // so the list does not reshuffle its top two rows between polls.
+    if (this.manager) {
+      const wizards = rows.filter((row) => row.agentProvider === undefined);
+      const remembered = rows.filter((row) => row.agentProvider !== undefined);
+      return [...wizards, await this.manager.describe(), ...remembered];
+    }
+    return rows;
   }
 
   get(id: string): Promise<LiveSession | undefined> {
+    if (this.manager && id === this.manager.id) return Promise.resolve(this.manager);
     return Promise.resolve(this.sessions.get(id));
+  }
+
+  /** Remembered rows only, oldest first — the manage menu asks "which of these is
+   *  stale", so the answer belongs at the top. Both synthetic rows are excluded by
+   *  `agentProvider`, which only a promoted session has. */
+  deletable(limit?: number): OwnedCatalogSession[] {
+    return [...this.sessions.values()]
+      .filter((session) => session.agentProvider !== undefined && !session.isDisposed)
+      .sort((a, b) => a.lastUsedMs - b.lastUsedMs)
+      .slice(0, Math.max(0, limit ?? Number.POSITIVE_INFINITY));
+  }
+
+  /** Forget a remembered session: stop it, release its lease, and remove its
+   *  on-disk metadata and history. Native provider transcripts are untouched.
+   *
+   *  The order is load-bearing. `store.remove()` refuses while `lease.json`
+   *  exists, and this server leases every eligible row from construction — so the
+   *  dispose has to come first. The map entry is dropped before the store call,
+   *  not after: by then the child is dead and the SSE stream ended, so a row left
+   *  in the map would hand `get(id)` a gutted session. If the store call then
+   *  throws, the record survives on disk and simply comes back on the next
+   *  restart, which is the least-bad failure available here. */
+  async forget(id: string): Promise<void> {
+    const session = this.sessions.get(id);
+    if (!session) throw new SessionControlError("Session not found.", 404);
+    if (!session.agentProvider) {
+      throw new SessionControlError("That row is not a remembered session; nothing is stored for it.", 409);
+    }
+    await session.dispose();
+    this.sessions.delete(id);
+    try {
+      this.store.remove(id);
+    } catch (error) {
+      if (error instanceof OwnedSessionStoreError) throw new SessionControlError(error.message, 409);
+      throw error;
+    }
   }
 
   async default(): Promise<LiveSession | undefined> {
@@ -727,6 +786,8 @@ export class OwnedSessionCatalog implements SessionCatalog {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.manager?.dispose();
+    this.manager = null;
     const sessions = [...this.sessions.values()];
     await Promise.allSettled(sessions.map((session) => session.dispose()));
   }
@@ -740,6 +801,17 @@ export class OwnedSessionCatalog implements SessionCatalog {
     if ([...this.sessions.values()].some((session) => session.isPendingSetup)) return;
     const session = new OwnedCatalogSession(`owned:${randomUUID()}`, this);
     this.sessions.set(session.id, session);
+  }
+
+  /** The manage row appears once there is anything to manage, so a fresh install
+   *  shows only the launcher. It is never torn down again: dropping it would
+   *  `res.end()` the phone's stream with no notification — the same hazard
+   *  `createSetup()` documents — so a manager with nothing left to delete says so
+   *  instead of vanishing mid-use. */
+  private ensureManager(): void {
+    if (this.disposed || this.manager) return;
+    if (!this.deletable(1).length) return;
+    this.manager = new OwnedManageSession(`owned:${randomUUID()}`, this);
   }
 
   private createSetup(): OwnedCatalogSession {
@@ -771,6 +843,9 @@ export class OwnedSessionCatalog implements SessionCatalog {
     nativeSessionId?: string,
   ): Promise<{ bridge: OwnedSessionBridge; nativeSessionId: string; model: string }> {
     if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
+    // acquireLease() below recreates the session directory, so a delete that
+    // landed while this attach was queued must not be undone by it.
+    if (session.isDisposed) throw new SessionControlError("This session was deleted.", 409);
     const providerConfig = this.config.providers[provider];
     if (!providerConfig) {
       throw new SessionControlError(`${providerLabel(provider)} is unavailable. Install it or set its *_BIN path, then restart even-better.`, 503);

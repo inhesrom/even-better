@@ -69,6 +69,7 @@ All under `/api`, bearer-token auth (`?token=` or `Authorization: Bearer`).
 | GET | `/messages` | ring-buffer replay (`?after=`) |
 | GET | `/update-check` | version check (static) |
 | GET | `/sessions/:id/history` | recent display history as `{ history:[{ role, text }] }` |
+| DELETE | `/sessions/:id` | **not stock** — the app never sends it. Permanently forgets a remembered owned session (`405` where the source cannot). The ＋ Manage sessions row reaches the same code path |
 | POST | `/prompt` | inject a user turn (`{ text, sessionId }`); in owned mode a null/missing ID creates a transient setup session and returns `202` with its stable ID, while a second prompt during setup returns `409` |
 | POST | `/permission-response` | answer a `permission_request` (`{ sessionId, decision }`) |
 | POST | `/question-response` | answer a `user_question` (`{ sessionId, answer }`) |
@@ -171,8 +172,25 @@ the slot for the next row. It is catalog state — never persisted, minted fresh
 after a restart. The stock app additionally renders its own **＋ New Session**
 row, which remains voice-first and never appears in `/api/sessions`.
 
-Opening the wizard row's `/events` stream emits a `user_prompt` prime, then the
-outstanding question after `SETUP_QUESTION_DELAY_MS` (default 500). **A
+A second synthetic row, **＋ Manage sessions**, appears once at least one session
+is remembered and sorts directly after the wizard. It removes sessions and does
+nothing else: a prompt to it returns `409`, and it is never a `default()` target.
+Its questions are `owned-manage:<id>:pick` (remembered sessions oldest-first,
+labelled `<n> · Agent · folder`, plus **More sessions…** when a page remains, plus
+**Cancel**) and `owned-manage:<id>:confirm` (**Delete forever** / **Keep**).
+Deleting ends that session's SSE stream, so the app sees the row disappear on its
+next `/api/sessions` poll.
+
+**A question's option count is bounded, and the bound is unknown.** Eleven options
+were silently not drawn on a physical phone — same failure signature as the
+same-tick question in ADR 0005: no error, no frame rejected, just a row awaiting an
+answer to a menu that is not there. The delete menu therefore pages at
+`MANAGE_SESSION_LIMIT` (default 4) and has no unlimited setting, unlike
+`WIZARD_DIRECTORY_LIMIT`, whose `0` predates this measurement and is now suspect
+for a workspace with many directories.
+
+Opening either synthetic row's `/events` stream emits a `user_prompt` prime, then
+the outstanding question after `SETUP_QUESTION_DELAY_MS` (default 500). **A
 `user_question` emitted in the same tick as the stream opening is silently
 dropped by the app** — see ADR 0005 for the measurement. Every stream open
 primes, reconnects included; answers emit their follow-up question synchronously,
