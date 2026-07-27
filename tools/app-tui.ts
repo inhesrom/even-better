@@ -399,9 +399,14 @@ function sessionLines(width: number, height: number): string[] {
 
 function pickerLines(width: number): string[] {
   const lines = [bold(clip(`even-better sim · ${base}`, width)), ""];
-  // The ＋ row is drawn by the client: it never appears in /api/sessions and
-  // selecting it makes no server request (docs/PROTOCOL.md §Provider).
-  [NEW_SESSION, ...rows.map((row) => `${row.title ?? row.id}${row.status ? dim(`  (${row.status})`) : ""}`)].forEach(
+  // The ＋ New Session row is drawn by the client: it never appears in
+  // /api/sessions and selecting it makes no server request (docs/PROTOCOL.md
+  // §Provider). ＋ Agent setup is a *server* row — open it to reach the wizard
+  // without speaking first, which is the ordinary way in.
+  [NEW_SESSION, ...rows.map((row) => {
+    const hint = row.title === "＋ Agent setup" ? "  (open to choose agent + directory)" : row.status ? `  (${row.status})` : "";
+    return `${row.title ?? row.id}${dim(hint)}`;
+  })].forEach(
     (label, index) => lines.push(index === pick ? bold(`  ❯ ${label}`) : `    ${dim(label)}`),
   );
   lines.push("", notice ? red(clip(notice, width)) : dim("↑↓ select · ⏎ open · q quit"));

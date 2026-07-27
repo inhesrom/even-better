@@ -163,19 +163,34 @@ session descriptor, `/status`, status events, prompt responses, and results, and
 ignores the phone's `?provider=codex` session filter. Codex is only the static
 app's compatibility handshake. Completed owned rows additionally carry
 `agentProvider:"claude"|"codex"|"grok"`; titles also expose the real provider.
-The catalog lists remembered sessions only. The stock app independently renders
-the sole **＋ New Session** row, which remains voice-first and does not appear in
-`/api/sessions`. Its first `POST /prompt` has a null or missing `sessionId`;
-owned mode creates a transient session, retains the prompt, and returns `202`
-with a stable public ID. That ID's `/events` stream emits the agent question;
-the directory question follows the answer. During setup the descriptor title is
-**Setting up agent session…**, it has no `agentProvider`, and an additional
-prompt returns `409`.
+The catalog lists remembered sessions plus exactly **one** wizard row, which
+carries no `agentProvider`. Untouched its title is **＋ Agent setup**; once a
+＋ New Session prompt adopts it, **Setting up · excerpt**; while its provider
+boots, **Starting Agent · folder…**. Only a setup that has begun starting frees
+the slot for the next row. It is catalog state — never persisted, minted fresh
+after a restart. The stock app additionally renders its own **＋ New Session**
+row, which remains voice-first and never appears in `/api/sessions`.
 
-After provider startup, owned mode persists the native resume ID and first
-prompt, appends the prompt to display history, converts that same public ID into
-a remembered session, and emits its `user_prompt` exactly once through the
-owned bridge. Startup failure keeps the transient session and retained prompt
+Opening the wizard row's `/events` stream emits a `user_prompt` prime, then the
+outstanding question after `SETUP_QUESTION_DELAY_MS` (default 500). **A
+`user_question` emitted in the same tick as the stream opening is silently
+dropped by the app** — see ADR 0005 for the measurement. Every stream open
+primes, reconnects included; answers emit their follow-up question synchronously,
+so only the first question after a stream opens needs the deferral.
+
+A ＋ New Session prompt has a null or missing `sessionId`; owned mode adopts the
+wizard row, retains the prompt, and returns `202` with its stable public ID. An
+additional prompt to an unfinished wizard returns `409`.
+
+After provider startup, owned mode persists the native resume ID, converts that
+same public ID into a remembered session, and — if a prompt was retained —
+appends it to display history and emits its `user_prompt` exactly once through
+the owned bridge. With no retained prompt the session lands `status: idle` with a
+**Ready — say your prompt** notification, `firstPrompt` unset, and a title of
+`Agent · folder` until the first spoken prompt fills it; that notification
+re-emits on reconnect while `firstPrompt` is unset, since `notification` is
+append-only and the app never replays. Startup failure keeps the transient
+session and retained prompt
 and asks one retry question (`toolUseId` `owned-setup:<id>:retry`) offering
 **Retry** / **Change directory** / **Change agent**, keeping both earlier
 answers; it never re-asks the agent and directory questions on its own. While a

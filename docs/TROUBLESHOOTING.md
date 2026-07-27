@@ -38,21 +38,32 @@ Session** creation row. A Claude/Grok row still has `provider:"codex"`; inspect
 
 ## Owned creation, persistence, and resume failures
 
-Before the first prompt, `GET /api/sessions` should contain remembered sessions
-only. Submitting a voice prompt from the stock **＋ New Session** row should
-return `202` with an `owned:` session ID. That ID appears temporarily as
-**Setting up agent session…**; connecting its SSE stream emits the agent
-question, and answering it emits the directory question.
+`GET /api/sessions` should always contain remembered sessions plus exactly one
+wizard row, titled **＋ Agent setup** until something claims it. Connecting its
+SSE stream should emit a `user_prompt` reading `New agent session`, then the
+agent question roughly `SETUP_QUESTION_DELAY_MS` later; answering it emits the
+directory question synchronously.
 
-After directory selection, the same ID should become **Provider · folder ·
-prompt excerpt**. Persisted metadata and display history should contain the
-first prompt, and the event stream should contain one matching `user_prompt`
-followed by the provider turn. A second prompt targeting unfinished setup should
-return `409` so the retained prompt cannot be replaced or duplicated.
+**The menu never appears on the glasses.** The question is almost certainly
+arriving in the same tick as the stream opening, which the app silently drops —
+this is ADR 0005's measurement and the reason for the delay. Confirm the ordering
+in `LOG_FILE`; if the frames are right but the phone is slower than the one this
+was measured on, raise `SETUP_QUESTION_DELAY_MS`.
+
+After directory selection the same ID should become **Provider · folder**, and
+the session should land `status: idle` with a **Ready — say your prompt**
+notification. Speaking a prompt then retitles it **Provider · folder · prompt
+excerpt** and writes `firstPrompt` to persisted metadata and display history.
+
+A ＋ New Session voice prompt instead returns `202` with the wizard row's own
+`owned:` ID, retitles it **Setting up · excerpt**, and is dispatched once after
+startup — so that path shows the `user_prompt` immediately rather than the
+readiness notification. A second prompt to an unfinished wizard returns `409` so
+the retained prompt cannot be replaced or duplicated.
 
 If provider startup fails, the notification should be followed by a replayed
-setup question; the original prompt remains pending for the retry. Unfinished
-setup is transient and can be lost on server restart, while completed sessions
+setup question; any retained prompt remains pending for the retry. The wizard row
+is transient and is minted fresh on server restart, while completed sessions
 remain durable.
 
 The launch cwd is the default workspace root. Explicit `--workspace-root`

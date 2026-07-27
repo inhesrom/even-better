@@ -64,6 +64,19 @@ function compactPrompt(prompt: string, limit = 56): string {
   return points.length > limit ? `${points.slice(0, limit).join("")}…` : normalized;
 }
 
+/** The prime that makes the stock app render the wizard's first question.
+ *
+ *  ADR 0004 measured that the app ignored a `user_question` emitted when a
+ *  server-authored row opened, and concluded such rows could not host a menu.
+ *  ADR 0005 measured *why*: the question must not arrive in the same tick as the
+ *  stream opening, and the stream must first carry something that looks like a
+ *  turn. A `user_prompt` followed by the question one delay later renders and is
+ *  answerable on a physical phone; the same payload sent synchronously is dropped.
+ *
+ *  Only the first question needs this. Answers emit their follow-up question
+ *  synchronously and the app renders those fine. */
+const SETUP_PRIME_TEXT = "New agent session";
+
 /** Which wizard question is outstanding. Tracked explicitly because the retry step
  *  keeps both earlier answers, so "which question is this" can no longer be inferred
  *  from whether `selectedProvider` is set. */
@@ -110,6 +123,7 @@ class OwnedCatalogSession implements LiveSession {
   private releaseLease: (() => void) | null = null;
   private attachPromise: Promise<OwnedSessionBridge> | null = null;
   private setup: SetupState | null;
+  private questionTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private readonly createdAt = new Date().toISOString();
 
@@ -162,7 +176,7 @@ class OwnedCatalogSession implements LiveSession {
     if (!this.record) {
       return Promise.resolve({
         id: this.id,
-        title: "Setting up agent session…",
+        title: this.setupTitle(),
         timestamp: this.createdAt,
         cwd: "",
         provider: "codex",
@@ -181,6 +195,19 @@ class OwnedCatalogSession implements LiveSession {
       status: this.state,
       model: this.record.model,
     });
+  }
+
+  /** The launcher and a wizard already under way must not read alike on the
+   *  glasses: the list shows both while one is starting. */
+  private setupTitle(): string {
+    const setup = this.setup;
+    if (!setup) return "Setting up agent session…";
+    if (setup.starting) {
+      const provider = setup.selectedProvider ? providerLabel(setup.selectedProvider) : "agent";
+      return `Starting ${provider} · ${path.basename(setup.selectedCwd || "/")}…`;
+    }
+    if (setup.firstPrompt !== null) return `Setting up · ${compactPrompt(setup.firstPrompt)}`;
+    return "＋ Agent setup";
   }
 
   async prompt(text: string): Promise<void> {
@@ -225,6 +252,10 @@ class OwnedCatalogSession implements LiveSession {
       case "retry":
         this.answerRetry(value);
         return;
+      default: {
+        const unreachable: never = this.setup.step;
+        throw new Error(`Unhandled setup step: ${String(unreachable)}`);
+      }
     }
   }
 
@@ -242,15 +273,38 @@ class OwnedCatalogSession implements LiveSession {
         if (provider) this.notify(`Starting ${providerLabel(provider)}…`, "The agent is still starting.");
         return;
       }
-      if (this.setup.step === "provider") this.askProvider(false);
-      else if (this.setup.step === "directory") this.askDirectory(false);
-      else this.askRetry(false);
-      return;
+      // See SETUP_PRIME_TEXT: without this the app drops the question that
+      // replayPending() is about to schedule.
+      emit(this.id, { type: "user_prompt", text: SETUP_PRIME_TEXT });
+      // Exhaustive on purpose: an if/else chain mapped every unlisted step to the
+      // retry menu, so a new step would silently replay the wrong question.
+      switch (this.setup.step) {
+        case "provider":
+          this.askProvider(false);
+          return;
+        case "directory":
+          this.askDirectory(false);
+          return;
+        case "retry":
+          this.askRetry(false);
+          return;
+        default: {
+          const unreachable: never = this.setup.step;
+          throw new Error(`Unhandled setup step: ${String(unreachable)}`);
+        }
+      }
     }
     try {
       await this.ensureAttached(false);
     } catch {
       // ensureAttached already emits the actionable notification for SSE entry.
+      return;
+    }
+    // `notification` is append-only and the app never replays, so the readiness line
+    // is gone after a reconnect. `firstPrompt` doubles as "has this session ever run
+    // a prompt", so this stops announcing the moment a real one lands.
+    if (this.record && !this.record.firstPrompt) {
+      this.announceReady(this.record.agentProvider, this.record.cwd);
     }
   }
 
@@ -261,7 +315,17 @@ class OwnedCatalogSession implements LiveSession {
 
   replayPending(): void {
     if (this.setup) {
-      if (!this.setup.starting) emit(this.id, this.setup.pendingWire);
+      if (this.setup.starting) return;
+      const wire = this.setup.pendingWire;
+      // Deferred, not synchronous: see SETUP_PRIME_TEXT. index.ts pushes its status
+      // snapshot between the prime and this, which is the order measured to work.
+      clearTimeout(this.questionTimer ?? undefined);
+      this.questionTimer = setTimeout(() => {
+        this.questionTimer = null;
+        if (this.setup && !this.setup.starting) emit(this.id, wire);
+      }, this.catalog.config.setupQuestionDelayMs);
+      // A wizard nobody answers must not be why the process cannot exit.
+      this.questionTimer.unref();
       return;
     }
     this.bridge?.replayPending();
@@ -290,6 +354,8 @@ class OwnedCatalogSession implements LiveSession {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    clearTimeout(this.questionTimer ?? undefined);
+    this.questionTimer = null;
     // The lease must be released even when the provider teardown throws (a
     // Grok process group that will not reap does), or shutdown leaves a live
     // lease.json behind and the session is unattachable until it goes stale.
@@ -458,7 +524,9 @@ class OwnedCatalogSession implements LiveSession {
 
   private askDirectory(send: boolean): void {
     this.setup!.step = "directory";
-    this.setup!.displayedDirectories = this.catalog.config.workspaces.choices(4);
+    this.setup!.displayedDirectories = this.catalog.config.workspaces.choices(
+      this.catalog.config.directoryLimit || undefined,
+    );
     const wire = {
       type: "user_question",
       questions: [{
@@ -509,10 +577,9 @@ class OwnedCatalogSession implements LiveSession {
 
   private async launch(provider: ProviderId, cwd: string): Promise<void> {
     const setup = this.setup!;
+    // The wizard now runs ahead of the real prompt, so finishing with nothing to
+    // dispatch is the ordinary case: the session lands idle and asks for one.
     const firstPrompt = setup.firstPrompt;
-    if (firstPrompt === null) {
-      throw new SessionControlError("This setup session has no retained first prompt.", 409);
-    }
     setup.starting = true;
     setup.selectedProvider = provider;
     setup.selectedCwd = cwd;
@@ -534,7 +601,10 @@ class OwnedCatalogSession implements LiveSession {
         createdAt: now,
         updatedAt: now,
         lastUsedAt: now,
-        firstPrompt,
+        // Only a prompt that actually runs is the session's first prompt. Leaving it
+        // unset keeps the row titled `Claude · dir` until prompt() fills it with the
+        // first spoken one, so the title never reads back a launch gesture.
+        ...(firstPrompt !== null ? { firstPrompt } : {}),
       };
       this.catalog.store.save(record);
       this.record = record;
@@ -566,6 +636,11 @@ class OwnedCatalogSession implements LiveSession {
       return;
     }
 
+    if (firstPrompt === null) {
+      this.announceReady(provider, cwd);
+      return;
+    }
+
     try {
       this.catalog.store.appendHistory(this.id, { role: "user", text: firstPrompt, timestamp: now });
       await attached.bridge.prompt(firstPrompt);
@@ -583,6 +658,17 @@ class OwnedCatalogSession implements LiveSession {
     if (!this.record) return;
     if (updateTimestamp) this.record.updatedAt = new Date().toISOString();
     this.catalog.store.save(this.record);
+  }
+
+  /** The human-readable half of "this session accepts input"; `status: idle` is
+   *  already on the wire. Without it a started-but-unprompted session is
+   *  indistinguishable from a blank one, and a blank session is what makes people
+   *  re-tap ＋ New Session. */
+  private announceReady(provider: ProviderId, cwd: string): void {
+    this.notify(
+      "Ready — say your prompt",
+      `${providerLabel(provider)} is running in ${path.basename(cwd || "/")}. Say your first prompt now.`,
+    );
   }
 
   private notify(title: string, message: string): void {
@@ -617,6 +703,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
   }
 
   async list(): Promise<SessionDescriptor[]> {
+    this.ensureLauncher();
     const sessions = [...this.sessions.values()];
     sessions.sort((a, b) => {
       if (a.agentProvider === undefined && b.agentProvider !== undefined) return -1;
@@ -657,6 +744,17 @@ export class OwnedSessionCatalog implements SessionCatalog {
     await Promise.allSettled(sessions.map((session) => session.dispose()));
   }
 
+  /** Keep exactly one openable wizard row in the list. This is the whole point of the
+   *  reordering: it is reachable before any prompt exists, so agent and directory are
+   *  chosen first. One at a time — a wizard already under way is that row, and only a
+   *  setup that has begun starting a provider frees the slot for the next one. */
+  private ensureLauncher(): void {
+    if (this.disposed) return;
+    if ([...this.sessions.values()].some((session) => session.isPendingSetup)) return;
+    const session = new OwnedCatalogSession(`owned:${randomUUID()}`, this);
+    this.sessions.set(session.id, session);
+  }
+
   private createSetup(): OwnedCatalogSession {
     // At most one setup is ever in flight: the stock app renders a single
     // ＋ New Session row, and the wizard state lives on the session its first prompt
@@ -664,8 +762,8 @@ export class OwnedSessionCatalog implements SessionCatalog {
     // pending setup is reused rather than replaced. Disposing it instead ended its SSE
     // stream (res.end(), with no notification first), so a duplicate or late prompt
     // killed the wizard the phone had open. Reuse also keeps setups from accumulating
-    // — they sort first in list(), so leaking them fills the phone's list with
-    // "Setting up agent session…" rows.
+    // — they sort first in list(), so leaking them fills the top of the phone's list.
+    // In practice this reuses the ＋ Agent setup row ensureLauncher() keeps around.
     // A setup already mid-launch is left alone: it owns a spawning child and the
     // user's retained prompt. If that launch fails it becomes pending again, and the
     // next restart reuses it.

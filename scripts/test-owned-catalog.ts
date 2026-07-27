@@ -9,7 +9,7 @@ import type { OwnedConfig, OwnedProviderConfig } from "../src/owned-config.js";
 import { OwnedSessionCatalog } from "../src/owned-session-catalog.js";
 import { OwnedSessionStore, type RememberedSessionMetadata } from "../src/owned-session-store.js";
 import { OwnedWorkspaceCatalog } from "../src/owned-workspaces.js";
-import type { LiveSession, ProviderId } from "../src/session.js";
+import type { LiveSession, ProviderId, SessionDescriptor } from "../src/session.js";
 import { getMessages } from "../src/sse.js";
 
 const scratch = await mkdtemp(path.join(os.tmpdir(), "even-better-owned-catalog-"));
@@ -25,10 +25,14 @@ const providerConfig: OwnedProviderConfig = {
   shutdownTimeoutMs: 100,
 };
 
-function config(homeDir: string, maxSessions = 6): OwnedConfig {
+function config(homeDir: string, maxSessions = 6, directoryLimit = 0): OwnedConfig {
   return {
     homeDir,
     maxSessions,
+    directoryLimit,
+    // The real delay exists only to survive the app's renderer; settle() covers the
+    // one tick setTimeout(0) still costs.
+    setupQuestionDelayMs: 0,
     workspaces: new OwnedWorkspaceCatalog([scratch]),
     providers: { claude: providerConfig, codex: providerConfig, grok: providerConfig },
   };
@@ -147,25 +151,49 @@ const asked = (session: LiveSession, step: string): number =>
 const notified = (session: LiveSession, title: string): boolean =>
   getMessages(session.id, 0).some((message) => (message as { title?: string }).title === title);
 
-test("the first null-session prompt creates a replayable setup session", async () => {
+/** The list minus the wizard row, which the catalog now always offers so agent and
+ *  directory can be chosen before any prompt exists. Setup rows carry no
+ *  `agentProvider`; remembered ones always do. */
+const agentRows = (items: SessionDescriptor[]): SessionDescriptor[] =>
+  items.filter((item) => item.agentProvider !== undefined);
+
+const wizardRows = (items: SessionDescriptor[]): SessionDescriptor[] =>
+  items.filter((item) => item.agentProvider === undefined);
+
+test("an openable wizard row exists before any prompt and adopts one when it arrives", async () => {
   const home = path.join(scratch, "state-prompt-setup");
   const catalog = new OwnedSessionCatalog(config(home), factory([]));
   try {
-    assert.deepEqual(await catalog.list(), []);
+    // The whole point of the reordering: a way into the wizard that exists before the
+    // user has said anything, so agent and directory come first.
+    const initial = await catalog.list();
+    assert.deepEqual(agentRows(initial), []);
+    assert.equal(initial.length, 1);
+    assert.equal(initial[0]?.title, "＋ Agent setup");
 
     const session = await catalog.default();
     assert.ok(session);
+    // A ＋ New Session prompt takes over that same row rather than adding a second.
+    assert.equal(session.id, initial[0]?.id);
     await session.prompt("first prompt");
     const publicId = session.id;
 
     assert.match(publicId, /^owned:/);
     assert.equal((await catalog.get(publicId))?.id, publicId);
-    assert.equal((await catalog.list())[0]?.title, "Setting up agent session…");
-    assert.ok((await catalog.list()).every((item) => item.title !== "＋ Agent setup"));
+    const carrying = await catalog.list();
+    assert.equal(carrying.length, 1);
+    assert.equal(carrying[0]?.title, "Setting up · first prompt");
 
     await session.onConnect?.();
     session.replayPending?.();
+    // The prime is what makes the app render the question that follows it.
     assert.ok(getMessages(publicId, 0).some((message) =>
+      (message as { type?: string; text?: string }).type === "user_prompt"
+      && (message as { text?: string }).text === "New agent session",
+    ));
+    // Deferred by a tick even at delay 0 — the app drops a question sent in the same
+    // tick as the stream opening.
+    await settle(() => getMessages(publicId, 0).some((message) =>
       (message as { type?: string; toolUseId?: string }).type === "user_question"
       && (message as { toolUseId?: string }).toolUseId?.endsWith(":provider"),
     ));
@@ -181,7 +209,7 @@ test("a restarted setup reuses its public id instead of dropping the phone's str
   const catalog = new OwnedSessionCatalog(config(home), factory(agents));
   try {
     // Every null-session prompt used to mint a permanent map entry, and setups sort
-    // first in list(), so the phone's list filled with "Setting up agent session…"
+    // first in list(), so the top of the phone's list filled with dead wizard
     // rows. Disposing the previous one instead ended its SSE stream with no
     // notification, which killed the wizard the phone had open whenever a prompt
     // arrived twice. Reusing the pending setup does both jobs.
@@ -192,7 +220,7 @@ test("a restarted setup reuses its public id instead of dropping the phone's str
     }
     const listed = await catalog.list();
     assert.equal(listed.length, 1, `expected one setup row, got ${JSON.stringify(listed.map((s) => s.title))}`);
-    assert.equal(listed[0]?.title, "Setting up agent session…");
+    assert.equal(listed[0]?.title, "Setting up · abandoned 4");
     // One stable public id across every restart, still resolvable — the app keeps its
     // stream and its id rather than being left on a dead one.
     assert.equal(new Set(ids).size, 1);
@@ -239,11 +267,12 @@ test("successful setup persists and dispatches the retained first prompt once", 
       { role: "user", text: "inspect this project" },
       { role: "assistant", text: "reply to inspect this project" },
     ]);
-    const descriptors = await catalog.list();
+    const descriptors = agentRows(await catalog.list());
     assert.equal(descriptors.length, 1);
     assert.equal(descriptors[0]?.id, publicId);
     assert.equal(descriptors[0]?.title, "Claude · project · inspect this project");
-    assert.ok(descriptors.every((item) => item.title !== "＋ Agent setup"));
+    // Promotion frees the wizard slot, so the list offers a fresh way in.
+    assert.equal(wizardRows(await catalog.list())[0]?.title, "＋ Agent setup");
   } finally {
     await catalog.dispose();
   }
@@ -268,7 +297,7 @@ test("provider startup failure reopens setup with the first prompt retained", as
     await session.respondQuestion(project);
     await settle(() => asked(session, "retry") >= 1);
     assert.equal(session.agentProvider, undefined);
-    assert.equal((await session.describe()).title, "Setting up agent session…");
+    assert.equal((await session.describe()).title, "Setting up · keep this exact prompt");
     assert.ok(notified(session, "Claude could not start"));
     // A failed start reopens as a one-tap retry that keeps both answers. Walking the
     // glasses back through the agent and directory questions is what looped the
@@ -347,7 +376,7 @@ test("the retry menu keeps both answers and never reopens the whole wizard", asy
     await settle(() => asked(session, "retry") >= 4);
     assert.equal(agents.at(-1)?.provider, "codex");
     assert.equal(session.agentProvider, undefined);
-    assert.equal((await session.describe()).title, "Setting up agent session…");
+    assert.equal((await session.describe()).title, "Setting up · retry me");
     assert.equal(catalog.store.get(session.id), undefined);
   } finally {
     await catalog.dispose();
@@ -358,7 +387,7 @@ test("restart lists remembered sessions only and lazily resumes their native con
   const home = path.join(scratch, "state-main");
   const agents: FakeAgent[] = [];
   const catalog = new OwnedSessionCatalog(config(home), factory(agents));
-  assert.deepEqual(await catalog.list(), []);
+  assert.deepEqual(agentRows(await catalog.list()), []);
   const fresh = await setup(catalog, "claude", "first prompt");
   const publicId = fresh.id;
   assert.equal(fresh.id, publicId);
@@ -377,11 +406,13 @@ test("restart lists remembered sessions only and lazily resumes their native con
   const resumedAgents: FakeAgent[] = [];
   const restored = new OwnedSessionCatalog(config(home), factory(resumedAgents));
   try {
-    const descriptors = await restored.list();
+    // Restart restores remembered rows only; the wizard row is catalog state, minted
+    // fresh, and never persisted.
+    const descriptors = agentRows(await restored.list());
     assert.equal(descriptors.length, 1);
     assert.equal(descriptors[0]?.id, publicId);
     assert.match(descriptors[0]?.title ?? "", /^Claude · project · first prompt$/);
-    assert.ok(descriptors.every((session) => session.title !== "＋ Agent setup"));
+    assert.equal(wizardRows(await restored.list()).length, 1);
     const remembered = await restored.get(publicId);
     assert.ok(remembered);
     assert.deepEqual(await remembered.history?.(), [
@@ -419,8 +450,7 @@ test("MAX_OWNED_SESSIONS caps attached processes and evicts only idle LRU sessio
     assert.equal(first.state, "busy");
     assert.equal(agents[2]?.disposed, 0);
     const afterFailedSetup = await catalog.list();
-    assert.equal(afterFailedSetup.filter((session) => session.title === "Setting up agent session…").length, 1);
-    assert.ok(afterFailedSetup.every((session) => session.title !== "＋ Agent setup"));
+    assert.equal(wizardRows(afterFailedSetup).length, 1);
     assert.equal(afterFailedSetup[0]?.id, third.id);
     assert.ok(notified(third, "Agent process limit reached"));
 
