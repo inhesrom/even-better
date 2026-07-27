@@ -74,7 +74,9 @@ transient setup session with a stable public ID. The wizard retains that prompt
 while it chooses a provider and directory. Successful setup starts and persists
 the native provider session, transforms the same public ID into a remembered
 session, and forwards the retained prompt through `OwnedSessionBridge` exactly
-once. Additional prompts are rejected while setup is unfinished.
+once. Additional prompts targeting that ID are rejected while setup is
+unfinished; another *null-session* prompt restarts the wizard in place on the
+same ID, because disposing the pending setup would end the phone's SSE stream.
 
 `OwnedAgent` is deliberately source-neutral: adapters only own their native
 process/protocol and emit normalized prose, tool, plan, usage, interaction,

@@ -176,7 +176,15 @@ After provider startup, owned mode persists the native resume ID and first
 prompt, appends the prompt to display history, converts that same public ID into
 a remembered session, and emits its `user_prompt` exactly once through the
 owned bridge. Startup failure keeps the transient session and retained prompt
-and reopens setup. The phone's creation and follow-up `provider` and `cwd`
+and asks one retry question (`toolUseId` `owned-setup:<id>:retry`) offering
+**Retry** / **Change directory** / **Change agent**, keeping both earlier
+answers; it never re-asks the agent and directory questions on its own. While a
+question is outstanding, a further null-session prompt restarts the wizard in
+place on the **same** public ID; one that arrives while the provider is starting
+gets its own transient session instead, since the first is already committed to
+a spawning child and a retained prompt. Neither case ever drops a stream. The
+directory answer returns as soon as it is accepted — provider startup runs in the
+background and reports over SSE. The phone's creation and follow-up `provider` and `cwd`
 fields are ignored; the glasses wizard is authoritative and cannot retarget an
 existing remembered session.
 

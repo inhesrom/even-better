@@ -173,6 +173,43 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   roots and requested paths with real paths; reject nonexistent/inaccessible
   directories, ambiguous relative paths, and symlink escapes. Never create a
   requested directory or trust the phone's `provider`/`cwd` fields.
+- **Logging must never throw and never grow unbounded.** `console.log` on a closed
+  stdout throws `EPIPE`; the tee must call the original inside its own `try`, or
+  that throw reaches `index.ts`'s `uncaughtException` handler, which logs via
+  `console.error` and throws again — a loop that wrote **5.3 GB into tmpfs in
+  5.5 minutes** and starved every other process on the box. Both log files go
+  through `cappedAppender` (`LOG_MAX_BYTES`, earliest bytes kept — never rotate,
+  the boot banner and first stack are what diagnose a loop), and the event log's
+  cap notice is itself JSON because `docs/TROUBLESHOOTING.md` reads that file with
+  `jq`. Stdio-death codes are non-fatal in `onFatal`: a lost terminal must not
+  dispose live owned sessions.
+- **A failed owned startup asks to retry; it never reopens the wizard.** Resetting
+  the answers and re-asking agent + directory turned one timing-out provider into
+  an infinite loop on the glasses — four full cycles in two minutes, observed.
+  `launch()`'s catch keeps `selectedProvider`/`selectedCwd` and asks the single
+  `:retry` question, so the wizard advances only on a deliberate tap. `SetupStep`
+  is explicit for the same reason: with answers retained, the outstanding question
+  can no longer be inferred from `selectedProvider === null`.
+- **A pending setup is reused, never disposed.** `createSetup()` restarts the
+  wizard in place on the same public id. Disposing it calls `dropSession`, which
+  `res.end()`s the phone's SSE stream with no notification — so the second
+  null-session prompt the voice-first ＋ row makes easy to send killed the very
+  wizard the glasses were showing. Startup is also fire-and-forget
+  (`beginLaunch`): awaiting it held the answer's POST open for the whole cold
+  start, and the glasses saw nothing at all until it finished.
+- **Teardown must reach a child that is still spawning.** `attachNow` installs the
+  bridge only once `start()` resolves, so a `dispose()` landing mid-spawn found
+  `session.bridge === null`, disposed nothing, and let the session promote *after*
+  shutdown — writing `metadata.json` and leaving a live bridge whose stats interval
+  kept the process alive, with a detached codex/grok child orphaned. `startingBridge`
+  holds it for that window and `detach()` disposes either one; `attachNow` re-checks
+  `disposed` after `start()` so a late resolve cannot promote.
+- **Turn completion must always terminalize.** `finishTurn` sets `terminalizing`,
+  which gates `prompt()` (409) and `interrupt()` (early return), so it must clear
+  in a `finally` and the persistence hooks (`model`/`assistant`/`activity`, all
+  synchronous session-store writes) must run through `persist()`. An ENOSPC there
+  otherwise skips `result` + `status: idle` and wedges the session until restart —
+  losing a history line is the acceptable failure.
 - **Idle is debounced (`IDLE_GRACE_MS`).** herdr flips to idle transiently
   between tool calls (its prompt box flashes), so committing immediately blanks
   the thinking indicator and fires a spurious `result` mid-turn. Only commit

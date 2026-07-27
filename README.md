@@ -116,7 +116,7 @@ Everything is optional — `even-better` works with no flags.
 | `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
 | `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |
 | `GROK_BIN` | `grok` | Grok executable name or path; missing executables are omitted from the owned wizard |
-| `OWNED_STARTUP_TIMEOUT_MS` | `15000` | Per-agent startup deadline in owned mode |
+| `OWNED_STARTUP_TIMEOUT_MS` | `30000` | Per-agent startup deadline in owned mode. A cold Claude/Codex start on a loaded machine can exceed 15s; Codex applies this budget per startup stage |
 | `OWNED_CANCEL_TIMEOUT_MS` | `5000` | Owned-session interruption deadline |
 | `OWNED_SHUTDOWN_TIMEOUT_MS` | `2000` | Per-stage owned child shutdown deadline |
 | `GROK_STARTUP_TIMEOUT_MS` | `15000` | Total deadline for version check, ACP initialization, authentication, and session creation |
@@ -129,7 +129,8 @@ Everything is optional — `even-better` works with no flags.
 | `BRIDGE_TOKEN` | ephemeral | Bearer token encoded into the QR. Unset means a fresh per-process token every launch |
 | `LOG` | `normal` | Logging mode: `off`, `normal`, `debug`, or `trace` |
 | `LOG_FILE` | `/tmp/even-better-<id>.events.log` | JSONL event log path |
-| `CONSOLE_LOG_FILE` | `/tmp/even-better-<id>.log` | Human-readable diagnostic tee (token-redacted) |
+| `CONSOLE_LOG_FILE` | `/tmp/even-better-<id>.log` | Human-readable diagnostic tee (token-redacted, consecutive duplicates collapsed) |
+| `LOG_MAX_BYTES` | `67108864` | Per-file cap for both logs. The earliest bytes are kept and one final notice is written; nothing rotates |
 | `INSTANCE_ID` | process id | Names the two log files so parallel launches do not collide |
 | `SHOW_TOKEN` | – | Print the bearer token unmasked in the startup banner |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config/transcript root, honored by the tailer and the hook installer alike |

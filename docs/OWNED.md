@@ -48,9 +48,18 @@ prompt, appends the prompt to display history, turns the same public ID into a
 remembered session, and dispatches the retained prompt exactly once. Its title
 is immediately **Provider · folder · prompt excerpt**.
 
-If provider startup fails, even-better keeps the transient session and original
-prompt and reopens the wizard; retrying setup does not duplicate the prompt.
-Transient setup is intentionally not durable across a server restart.
+If provider startup fails, even-better keeps the transient session, the original
+prompt, **and both answers**, then asks a single retry question — **Retry**,
+**Change directory**, or **Change agent**. It never reopens the agent and
+directory questions by itself: a provider that keeps failing would otherwise walk
+the glasses through the whole wizard on every attempt, with no way out. Repeated
+failures carry an `(attempt N)` count. Retrying setup does not duplicate the
+prompt.
+
+Because the ＋ row is voice-first, a re-tap arrives as another null-session
+prompt. That **restarts the wizard on the same public ID** and keeps the phone's
+SSE stream; the newest prompt is the one retained. Transient setup is
+intentionally not durable across a server restart.
 
 The phone's creation `provider` and `cwd` fields are compatibility inputs and
 are ignored. The glasses wizard is authoritative, and the chosen agent provider
