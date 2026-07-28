@@ -145,6 +145,47 @@ summary" is a prompt. Every command question carries **Cancel**, and
 `POST /interrupt` also ends it — a command question opens a turn that has not
 reached the provider, so nothing else could release the session.
 
+## Agent modes
+
+Say **"change to auto mode"**, **"switch to plan mode"**, **"plan mode"** or
+**"/mode auto"** and the session switches between three modes. Say just
+**"mode"** — or name one we do not recognize — and you get a picker instead,
+with the mode you are already in marked `· current`.
+
+| Mode | What it means | Claude | Codex |
+|---|---|---|---|
+| **Plan** | Research and plan only; nothing is edited | `plan` | `collaborationMode: plan` + read-only sandbox |
+| **Normal** | Ask before edits and commands | `default` | `workspaceWrite` + `on-request` |
+| **Auto** | Edits apply without asking | `acceptEdits` | `workspaceWrite` + `never` |
+
+Auto deliberately stops at edits — there is no bypass-everything tier, because
+on the glasses you cannot read a command before it runs.
+
+Matching is **whole-prompt**. "Change to auto mode detection in the parser" is a
+prompt, not a mode switch; only a prompt that is *entirely* one of the recognized
+phrasings switches anything. A phrasing we miss just reaches the agent, which is
+the cheap failure — a prompt silently swallowed on the glasses is not.
+
+The mode is **remembered per session** and reapplied when the session resumes, so
+a session you left in Plan does not quietly come back able to edit. What is shown
+is always what the provider confirmed, never what was requested — including a
+mode the agent changed on its own.
+
+Switching is idle-only: `POST /interrupt` first, then switch. A provider that
+cannot switch at runtime says so and leaves the session usable; Grok has no mode
+capability today, so mode phrasing there is an ordinary prompt.
+
+**When a Claude plan is ready**, the approval *is* the mode decision:
+
+| Option | Effect |
+|---|---|
+| **Approve & auto** | Accept the plan and switch to Auto — execution proceeds unprompted |
+| **Approve, ask each step** | Accept the plan and switch to Normal |
+| **Keep planning** | Decline; the session stays in Plan |
+
+Codex has no plan-ready moment. Finishing a plan there means saying "change to
+auto mode" and prompting again. See ADR 0008.
+
 ## Providers and compatibility identity
 
 Owned mode uses one stock-app Codex connection for every row. `/api/info`,

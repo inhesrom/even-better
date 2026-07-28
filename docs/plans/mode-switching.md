@@ -1,7 +1,26 @@
 # Plan: glasses mode switching (Plan / Normal / Auto)
 
 Branch: `feat/agent-mode-switch` · Worktree: `~/repo/even-better-mode-switch`
-Status: agreed 2026-07-28 (grilled interview); not yet implemented.
+Status: **implemented 2026-07-28.** Kept as the record of the decisions; the
+shipped behaviour is documented in `docs/adr/0008-agent-mode-switching.md` and
+`docs/OWNED.md`.
+
+Two things below were corrected by probing the running CLI during
+implementation, and the ADR is authoritative where they disagree:
+
+- **Codex has a real plan mode.** `collaborationMode/list` advertises `Plan` and
+  `Default`, and `thread/settings/update` accepts
+  `collaborationMode: {mode, settings:{model}}`. Plan is that mode plus a
+  read-only sandbox as backstop — not the "simulation" step 3 and the risks
+  section describe. The Codex asymmetry in decision 8 still holds: there is no
+  plan-*ready* moment, only a real plan mode.
+- **Claude's `system/init` field is `permissionMode`, not `mode`.**
+- Grok was **deferred** under decision 2: its ACP modes are agent-defined
+  strings, which the neutral vocabulary cannot express without a second parallel
+  menu path.
+- The seam ended up smaller than step 1/2/6 planned: no adapter `start()`
+  signature carries a mode. The bridge reapplies the remembered mode through the
+  same `setMode()` call a user switch uses, so there is one path to get wrong.
 
 ## Goal
 
