@@ -859,7 +859,7 @@ test("adopting promotes the pickup row in place and warms up the resume", async 
   try {
     const pickup = await openPickup(catalog);
 
-    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("1 · Claude · project · refactor the parser");
     await settle(() => asked(pickup, "confirm") >= 1);
     await pickup.respondQuestion("Pick up here");
     await settle(() => notified(pickup, "Session picked up"));
@@ -925,7 +925,7 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
     const pickup = await openPickup(catalog);
 
     // The literal "skip" index.ts substitutes for an empty body keeps the session.
-    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("1 · Claude · project · refactor the parser");
     await settle(() => asked(pickup, "confirm") >= 1);
     await pickup.respondQuestion("skip");
     await settle(() => asked(pickup, "confirm") >= 2);
@@ -938,7 +938,7 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
     // A candidate whose transcript vanished between pick and adopt.
     source.inspection = () => Promise.resolve(null);
     await settle(() => asked(pickup, "pick") >= 3);
-    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("1 · Claude · project · refactor the parser");
     await pickup.respondQuestion("Pick up here");
     await settle(() => notified(pickup, "Could not pick up session"));
     assert.deepEqual(store.list(), []);
@@ -952,7 +952,7 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
       source.inspection = () => Promise.resolve({ model: "fake-model" });
       await pickup.respondQuestion("Cancel");
       await settle(() => asked(pickup, "pick") >= 5);
-      await pickup.respondQuestion("1 · Claude · " + path.basename(outside));
+      await pickup.respondQuestion(`1 · Claude · ${path.basename(outside)} · refactor the parser`);
       await pickup.respondQuestion("Pick up here");
       await settle(() => getMessages(pickup.id, 0).some((message) =>
         (message as { message?: string }).message?.includes("WORKSPACE_ROOTS") === true,
@@ -1031,7 +1031,7 @@ test("a failed warm-up surfaces could-not-resume and a later prompt retries", as
   const catalog = new OwnedSessionCatalog(config(home), factory(agents, true), store, source);
   try {
     const pickup = await openPickup(catalog);
-    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("1 · Claude · project · refactor the parser");
     await pickup.respondQuestion("Pick up here");
     await settle(() => notified(pickup, "Claude session could not resume"));
     // The handoff already happened — the record and row survive the failed
@@ -1053,7 +1053,7 @@ test("a reconnect after handoff lands on the adopted session, and dispose tears 
   const store = new OwnedSessionStore(home);
   const catalog = new OwnedSessionCatalog(config(home), factory(agents), store, source);
   const pickup = await openPickup(catalog);
-  await pickup.respondQuestion("1 · Claude · project");
+  await pickup.respondQuestion("1 · Claude · project · refactor the parser");
   await pickup.respondQuestion("Pick up here");
   await settle(() => agents.length === 1);
   const picksBefore = asked(pickup, "pick");

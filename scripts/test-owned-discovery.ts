@@ -58,11 +58,17 @@ function writeRollout(at: number, uuid: string, lines: string[], name?: string):
 }
 
 function meta(uuid: string, cwd: string): string {
-  return JSON.stringify({ type: "session_meta", payload: { session_id: uuid, cwd, originator: "codex_cli_rs" } });
+  return JSON.stringify({
+    type: "session_meta",
+    payload: { session_id: uuid, cwd, originator: "codex_cli_rs", git: { branch: "feat/test-branch" } },
+  });
 }
 
 test("codex scan reads session_meta, honours the window, eligibility, and newest-first order", async () => {
-  writeRollout(NOW - 60_000, UUID_A, [meta(UUID_A, project)]);
+  writeRollout(NOW - 60_000, UUID_A, [
+    meta(UUID_A, project),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "tune the filter" } }),
+  ]);
   writeRollout(NOW - 120_000, UUID_B, [meta(UUID_B, project)]);
   // In today's directory but with an ancient mtime — excluded by the window.
   writeRollout(NOW - PICKUP_RECENCY_MS - 60_000, UUID_C, [meta(UUID_C, project)], `rollout-old-${UUID_C}.jsonl`);
@@ -80,6 +86,10 @@ test("codex scan reads session_meta, honours the window, eligibility, and newest
   );
   assert.equal(found[0]?.agentProvider, "codex");
   assert.equal(found[0]?.cwd, project);
+  // The first user message and the session_meta git branch feed the menu.
+  assert.equal(found[0]?.title, "tune the filter");
+  assert.equal(found[0]?.branch, "feat/test-branch");
+  assert.equal(found[1]?.title, "");
 });
 
 test("claude scan passes the terminal-parity options and filters stale, cwd-less, and ineligible sessions", async () => {
@@ -89,7 +99,7 @@ test("claude scan passes the terminal-parity options and filters stale, cwd-less
     listClaudeSessions: (options) => {
       calls.push(options);
       return Promise.resolve([
-        { sessionId: UUID_A, summary: "fix the parser", lastModified: NOW - 5_000, cwd: project },
+        { sessionId: UUID_A, summary: "fix the parser", gitBranch: "main", lastModified: NOW - 5_000, cwd: project },
         { sessionId: UUID_B, summary: "titled", customTitle: "my refactor", lastModified: NOW - 9_000, cwd: project },
         { sessionId: UUID_C, summary: "too old", lastModified: NOW - PICKUP_RECENCY_MS - 1, cwd: project },
         { sessionId: UUID_D, summary: "no cwd", lastModified: NOW - 1_000 },
@@ -106,6 +116,8 @@ test("claude scan passes the terminal-parity options and filters stale, cwd-less
       [UUID_B, "my refactor"], // customTitle wins over summary
     ],
   );
+  assert.equal(found[0]?.branch, "main");
+  assert.equal(found[1]?.branch, undefined);
 });
 
 test("candidates are TTL-cached, fresh bypasses, provider-set changes rescan, and a rejecting lister contributes []", async () => {
@@ -143,7 +155,8 @@ test("inspect reads codex model + first prompt, claude model + title, and report
     JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "refactor the reader" } }),
   ]);
   const discovery = new ExternalSessionDiscovery(workspaces, { now: () => NOW });
-  const codexCandidate = { agentProvider: "codex" as const, nativeSessionId: INSPECT_UUID, cwd: project, title: "", lastModifiedMs: NOW };
+  // The title is scan-populated; inspect passes it through as the first prompt.
+  const codexCandidate = { agentProvider: "codex" as const, nativeSessionId: INSPECT_UUID, cwd: project, title: "refactor the reader", lastModifiedMs: NOW };
   assert.deepEqual(await discovery.inspect(codexCandidate), { model: "gpt-5.5", firstPrompt: "refactor the reader" });
 
   const claudeDir = path.join(process.env.CLAUDE_CONFIG_DIR!, "projects", "-project");

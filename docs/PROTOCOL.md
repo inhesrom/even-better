@@ -184,9 +184,10 @@ next `/api/sessions` poll.
 A third synthetic row, **＋ Pick up session**, appears once a recent terminal
 `claude`/`codex` session is adoptable (ADR 0007) and sorts after the manage row.
 Its questions are `owned-pickup:<id>:pick` (candidates newest-first, labelled
-`<n> · Agent · folder` with an `Active <age>` description, plus **More
-sessions…** / **Cancel**) and `owned-pickup:<id>:confirm` (**Pick up here** /
-**Keep in terminal**). Confirming adopts **in place**: the row's own id becomes
+`<n> · Agent · folder · excerpt` — the session's title or first prompt, so two
+sessions in one directory read apart — with an `Active <age> · branch`
+description, plus **More sessions…** / **Cancel**) and
+`owned-pickup:<id>:confirm` (**Pick up here** / **Keep in terminal**). Confirming adopts **in place**: the row's own id becomes
 the remembered session (the wizard's promote-in-place), the open stream receives
 `status: idle` plus a **Session picked up** notification telling the user to
 speak, and the provider begins resuming in the background immediately. The next

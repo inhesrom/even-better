@@ -221,9 +221,10 @@ session listing plus a windowed scan of Codex's rollout files; no process is
 spawned to look.
 
 The row asks which session to pick up — newest first, labelled
-`<n> · Agent · folder` with an `Active <age>` freshness line and, for Claude, a
-title excerpt — paged at `PICKUP_SESSION_LIMIT` (default 4) with **More
-sessions…**, then confirms with **Pick up here** / **Keep in terminal**.
+`<n> · Agent · folder · excerpt` (the session's title or first prompt) with an
+`Active <age> · branch` freshness line — paged at `PICKUP_SESSION_LIMIT`
+(default 4) with **More sessions…**, then confirms with **Pick up here** /
+**Keep in terminal**.
 
 Picking up lands you in the session: the pickup row itself becomes the
 remembered row — same id, stream intact, exactly like the wizard promoting into

@@ -66,8 +66,10 @@ never ended — and a fresh row with a new id appears while candidates remain
 (wizard-slot semantics); it is never torn down while it exists (ADR 0006's
 hazard: dropping a row ends the phone's live stream). Its questions are `owned-pickup:<id>:pick` — candidates newest-first
 (the manage row is oldest-first because its question is "which is stale"; this
-one's is "which did I just leave"), labelled `<n> · Agent · folder` with an
-`Active <age>` freshness line, paged at `PICKUP_SESSION_LIMIT` (default 4) —
+one's is "which did I just leave"), labelled `<n> · Agent · folder · excerpt`
+(claude title/summary, codex first user message — read at scan time) with an
+`Active <age> · branch` freshness line, paged at `PICKUP_SESSION_LIMIT`
+(default 4) —
 and `owned-pickup:<id>:confirm` (**Pick up here** / **Keep in terminal**). It
 reaches the glasses through the same prime and deferral as the other synthetic
 rows (`owned-row-question.ts`).

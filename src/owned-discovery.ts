@@ -24,9 +24,11 @@ export interface ExternalSessionCandidate {
   nativeSessionId: string;
   /** As recorded by the CLI; canonicalized only at adopt (workspaces.resolve). */
   cwd: string;
-  /** Best free one-liner for menu labels: claude customTitle/summary/firstPrompt;
-   *  "" for codex, whose excerpt is only read at adopt time (inspect). */
+  /** One-liner for menu labels: claude customTitle/summary/firstPrompt; codex
+   *  first user message (capped head read); "" when the session has none. */
   title: string;
+  /** Git branch at the session's end, when the provider recorded one. */
+  branch?: string;
   lastModifiedMs: number;
 }
 
@@ -53,6 +55,7 @@ interface ClaudeSessionListing {
   lastModified: number;
   customTitle?: string;
   firstPrompt?: string;
+  gitBranch?: string;
   cwd?: string;
 }
 
@@ -158,12 +161,10 @@ export class ExternalSessionDiscovery implements ExternalSessionSource {
           ...(candidate.title ? { firstPrompt: candidate.title } : {}),
         };
       }
-      const file = findCodexSessionFile(candidate.nativeSessionId);
-      if (!file) return null;
-      const firstPrompt = await this.readCodexFirstPrompt(file);
+      if (!findCodexSessionFile(candidate.nativeSessionId)) return null;
       return {
         model: readCodexModel(candidate.nativeSessionId) ?? "",
-        ...(firstPrompt ? { firstPrompt } : {}),
+        ...(candidate.title ? { firstPrompt: candidate.title } : {}),
       };
     } catch {
       return null;
@@ -201,6 +202,7 @@ export class ExternalSessionDiscovery implements ExternalSessionSource {
         nativeSessionId: session.sessionId,
         cwd,
         title: session.customTitle || session.summary || session.firstPrompt || "",
+        ...(session.gitBranch ? { branch: session.gitBranch } : {}),
         lastModifiedMs: session.lastModified,
       });
     }
@@ -238,7 +240,12 @@ export class ExternalSessionDiscovery implements ExternalSessionSource {
           const mtimeMs = statSync(file).mtimeMs;
           if (now - mtimeMs > PICKUP_RECENCY_MS) continue;
           const candidate = await this.readCodexMeta(file, match[1], mtimeMs);
-          if (candidate) found.push(candidate);
+          if (!candidate) continue;
+          // Titles are read at scan time so the pick menu can identify the
+          // session; the set is already filtered, so this stays a handful of
+          // capped head reads.
+          candidate.title = (await this.readCodexFirstPrompt(file)) ?? "";
+          found.push(candidate);
         } catch {
           // Unreadable rollout — not a candidate.
         }
@@ -270,7 +277,17 @@ export class ExternalSessionDiscovery implements ExternalSessionSource {
         : filenameId;
     const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
     if (!cwd || !path.isAbsolute(cwd) || !this.workspaces.isEligible(cwd)) return null;
-    return { agentProvider: "codex", nativeSessionId: metaId, cwd, title: "", lastModifiedMs };
+    // session_meta lines carry an optional flattened `git` sibling (GitInfo);
+    // best-effort — absent or reshaped just means no branch in the menu.
+    const branch = isRecord(payload.git) && typeof payload.git.branch === "string" ? payload.git.branch : "";
+    return {
+      agentProvider: "codex",
+      nativeSessionId: metaId,
+      cwd,
+      title: "",
+      ...(branch ? { branch } : {}),
+      lastModifiedMs,
+    };
   }
 
   private async readCodexFirstPrompt(file: string): Promise<string | undefined> {

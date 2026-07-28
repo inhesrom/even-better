@@ -671,7 +671,7 @@ test("the pickup row adopts a terminal codex session, and the adopted row resume
         | undefined;
       assert.match(pick?.toolUseId ?? "", /^owned-pickup:/);
       const label = pick?.questions?.[0]?.options[0]?.label;
-      assert.equal(label, `1 · Codex · ${folder}`);
+      assert.equal(label, `1 · Codex · ${folder} · refactor the reader`);
 
       await answer(base, row.id, label!);
       await waitFor("the confirm menu", () => asked(stream, "confirm") >= 1);

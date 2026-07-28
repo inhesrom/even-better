@@ -37,15 +37,16 @@ type PickupStep = "pick" | "confirm";
 interface Candidate {
   /** What catalog.adopt() consumes, exactly as discovery listed it. */
   candidate: ExternalSessionCandidate;
-  /** Exactly what the menu showed. Answers carry no correlation id, so the label
-   *  is the only key back to the session — and the ordinal prefix is what makes
-   *  it unique when two sessions share a provider and a directory. */
+  /** Exactly what the menu showed, excerpt included — the label is what
+   *  identifies a session at a glance, and two sessions in one directory are
+   *  otherwise indistinguishable. Answers carry no correlation id, so the label
+   *  is also the only key back to the session; the ordinal prefix keeps it
+   *  unique and speakable. */
   label: string;
-  /** The string the confirm question names the session by: provider, folder, and
-   *  excerpt when one exists — the short label alone cannot tell two sessions in
-   *  one directory apart. */
+  /** The string the confirm question names the session by: provider, folder,
+   *  and excerpt when one exists. */
   title: string;
-  /** Freshness plus an excerpt. "Active <age>" is the row's substitute for
+  /** Freshness plus the git branch. "Active <age>" is the row's substitute for
    *  process-liveness detection: whether the terminal copy is still open is
    *  unknowable portably, so the menu shows recency and the confirm step warns. */
   description: string;
@@ -259,12 +260,12 @@ export class OwnedPickupSession implements LiveSession {
     const page = all.slice(this.pageStart, this.pageStart + size);
     this.displayed = page.map((candidate, index) => {
       const folder = path.basename(candidate.cwd || "/");
-      const excerpt = candidate.title ? compactPrompt(candidate.title, 40) : "";
+      const excerpt = candidate.title ? compactPrompt(candidate.title, 32) : "";
       return {
         candidate,
-        label: `${this.pageStart + index + 1} · ${providerLabel(candidate.agentProvider)} · ${folder}`,
+        label: `${this.pageStart + index + 1} · ${providerLabel(candidate.agentProvider)} · ${folder}${excerpt ? ` · ${excerpt}` : ""}`,
         title: `${providerLabel(candidate.agentProvider)} · ${folder}${excerpt ? ` · ${excerpt}` : ""}`,
-        description: `Active ${formatAge(candidate.lastModifiedMs, now)}${excerpt ? ` · ${excerpt}` : ""}`,
+        description: `Active ${formatAge(candidate.lastModifiedMs, now)}${candidate.branch ? ` · ${candidate.branch}` : ""}`,
       };
     });
     const remaining = all.length - (this.pageStart + page.length);
