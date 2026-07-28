@@ -1,18 +1,21 @@
 import { randomUUID } from "node:crypto";
-import type {
-  OwnedAgent,
-  OwnedAgentEvent,
-  OwnedAgentSink,
-  OwnedAgentStartInfo,
-  OwnedCommand,
-  OwnedPermissionDecision,
-  OwnedUsage,
+import {
+  AGENT_MODES,
+  type AgentMode,
+  type OwnedAgent,
+  type OwnedAgentEvent,
+  type OwnedAgentSink,
+  type OwnedAgentStartInfo,
+  type OwnedCommand,
+  type OwnedPermissionDecision,
+  type OwnedUsage,
 } from "./owned-agent.js";
 import {
   commandText,
   isDestructive,
   parseAnswer,
   parseCommandInput,
+  parseModeInput,
   resolveCommand,
   suggestCommands,
 } from "./owned-commands.js";
@@ -40,7 +43,9 @@ type Interaction =
   // A bridge-local interaction: its answer resolves a command and never reaches the
   // provider. `pick` chooses among near-misses, `args` collects a command's input,
   // `confirm` guards a destructive command.
-  | { type: "command"; stage: "pick" | "args" | "confirm"; candidates: OwnedCommand[]; chosen: OwnedCommand | null; args: string };
+  | { type: "command"; stage: "pick" | "args" | "confirm"; candidates: OwnedCommand[]; chosen: OwnedCommand | null; args: string }
+  // Also bridge-local: the mode picker. Its answer is a capability call, never text.
+  | { type: "mode" };
 
 type CommandPlan =
   | { kind: "prose" }
@@ -48,6 +53,29 @@ type CommandPlan =
   | { kind: "ask"; interaction: Extract<Interaction, { type: "command" }> };
 
 const CANCEL = "Cancel";
+
+const MODE_LABEL: Record<AgentMode, string> = { plan: "Plan", normal: "Normal", auto: "Auto" };
+
+const MODE_BLURB: Record<AgentMode, string> = {
+  plan: "Research and plan only; nothing is edited.",
+  normal: "Ask before edits and commands.",
+  auto: "Edits apply without asking.",
+};
+
+/** Appended to the mode the session is already in. `·` is one of only two glyphs
+ *  measured to render in this app; a check mark or a bullet is a blank space. */
+const CURRENT_MARK = " · current";
+
+/** What the app shows after a permission answer. Keyed by the decision so the
+ *  plan fork's three keys read as themselves rather than as a bare "Allowed". */
+const PERMISSION_RESULT: Record<OwnedPermissionDecision, { summary: string; decision: string }> = {
+  allow: { summary: "Allowed", decision: "allowed" },
+  allowAlways: { summary: "Allowed for this session", decision: "always" },
+  deny: { summary: "Denied", decision: "denied" },
+  planAuto: { summary: "Plan approved — Auto", decision: "allowed" },
+  planNormal: { summary: "Plan approved — Normal", decision: "allowed" },
+  planKeep: { summary: "Still planning", decision: "denied" },
+};
 
 function inputObject(input: unknown): Record<string, unknown> {
   if (typeof input === "object" && input !== null && !Array.isArray(input)) {
@@ -65,6 +93,7 @@ export interface OwnedSessionBridgeHooks {
   assistant?(text: string): void;
   activity?(): void;
   unavailable?(): void;
+  mode?(mode: AgentMode): void;
 }
 
 /** Provider-neutral owner of public ids, wire events, pacing, and turn state. */
@@ -89,6 +118,10 @@ export class OwnedSessionBridge implements OwnedAgentSink {
   private pendingWire: object | null = null;
   private turnUsage: OwnedUsage = { inputTokens: 0, outputTokens: 0, turns: 0 };
   private assistantHistory = "";
+  /** Provider truth, updated only from the agent's `mode` event. Seeded to the
+   *  same default the providers start in so the picker has a mark before the
+   *  first report. */
+  private currentMode: AgentMode = "normal";
 
   constructor(
     readonly id: string,
@@ -100,10 +133,28 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     this.out = new OutputStream((message) => emit(this.id, message), STREAM_TICK_MS);
   }
 
-  async start(nativeSessionId?: string): Promise<OwnedAgentStartInfo> {
+  /** `mode` is the session's remembered mode, reapplied here rather than passed into
+   *  each provider's own startup options: it runs the same capability call a user
+   *  switch does, so there is one code path to get wrong. No prompt can reach the
+   *  agent before this resolves, so the window in which the mode is still the
+   *  provider's default contains no turns. */
+  async start(nativeSessionId?: string, mode?: AgentMode): Promise<OwnedAgentStartInfo> {
     const info = await this.agent.start(this, nativeSessionId);
     this.model = info.model || this.model;
     this.available = true;
+    if (mode && mode !== "normal" && this.agent.setMode) {
+      try {
+        await this.agent.setMode(mode);
+      } catch (error) {
+        // A session that cannot restore its mode is still a usable session; saying so
+        // is better than failing the attach and stranding the row.
+        this.out.event({
+          type: "notification",
+          title: "Mode not restored",
+          message: `This session is remembered as ${MODE_LABEL[mode]}, but ${providerName(this.agentProvider)} would not switch: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
     return info;
   }
 
@@ -114,18 +165,26 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     if (this.state !== "idle" || this.terminalizing) {
       throw new SessionControlError(`${providerName(this.agentProvider)} is already processing a prompt.`, 409);
     }
-    const plan = this.planCommand(text);
+    // Ahead of command resolution, and only for a provider that can actually switch:
+    // everywhere else this text is an ordinary prompt and must stay one.
+    const wanted = this.agent.setMode ? parseModeInput(text) : null;
+    const plan = wanted ? null : this.planCommand(text);
     this.beginTurn();
     emit(this.id, { type: "user_prompt", text });
     emit(this.id, { type: "status", state: "busy", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
     // The turn is open before this point, so every command path that stops to ask is
     // inside a turn `finishTurn` will close — cancellation included.
-    if (plan.kind === "ask") {
-      this.askCommand(plan.interaction);
+    if (wanted) {
+      if (wanted.kind === "menu") this.askMode();
+      else await this.applyMode(wanted.mode);
+      return;
+    }
+    if (plan!.kind === "ask") {
+      this.askCommand(plan!.interaction);
       return;
     }
     try {
-      await this.agent.prompt(plan.kind === "dispatch" ? plan.text : text);
+      await this.agent.prompt(plan!.kind === "dispatch" ? plan!.text : text);
     } catch (error) {
       await this.finishFailure(error instanceof Error ? error.message : String(error));
       throw error;
@@ -165,9 +224,11 @@ export class OwnedSessionBridge implements OwnedAgentSink {
     if (!pending || pending.type !== "permission") {
       throw new SessionControlError(`No matching ${providerName(this.agentProvider)} permission request.`, 409);
     }
-    const normalized: OwnedPermissionDecision | null =
-      decision === "allowAlways" ? "allowAlways" : decision === "allow" ? "allow" : decision === "deny" ? "deny" : null;
-    if (!normalized || !pending.options.includes(normalized)) {
+    // Validated against what this interaction actually advertised rather than a fixed
+    // list, the same discipline `resolveCommand` follows: an adapter that never offers
+    // a key can never be handed it, and a new key needs no change here.
+    const normalized = pending.options.find((option) => option === decision);
+    if (!normalized) {
       throw new SessionControlError(`That permission choice was not offered by ${providerName(this.agentProvider)}.`, 409);
     }
     this.interaction = null;
@@ -178,8 +239,7 @@ export class OwnedSessionBridge implements OwnedAgentSink {
       emit(this.id, {
         type: "permission_result",
         toolName: pending.toolName,
-        summary: normalized === "allowAlways" ? "Allowed for this session" : normalized === "allow" ? "Allowed" : "Denied",
-        decision: normalized === "allowAlways" ? "always" : normalized === "allow" ? "allowed" : "denied",
+        ...PERMISSION_RESULT[normalized],
       });
     } catch {
       throw new SessionControlError(`Could not send the response to ${providerName(this.agentProvider)}.`, 502);
@@ -189,6 +249,10 @@ export class OwnedSessionBridge implements OwnedAgentSink {
   async respondQuestion(answer: string): Promise<void> {
     if (this.interaction?.type === "command") {
       await this.answerCommand(this.interaction, answer);
+      return;
+    }
+    if (this.interaction?.type === "mode") {
+      await this.answerMode(answer);
       return;
     }
     if (!this.interaction || this.interaction.type !== "question") {
@@ -207,7 +271,7 @@ export class OwnedSessionBridge implements OwnedAgentSink {
 
   async interrupt(): Promise<void> {
     if (this.state === "idle" || this.terminalizing) return;
-    if (this.interaction?.type === "command") {
+    if (this.interaction?.type === "command" || this.interaction?.type === "mode") {
       // The pseudo-turn has not reached the provider, so `agent.interrupt()` finds no
       // active turn and returns without doing anything — leaving the session busy with
       // nothing running. Ending the turn here is the only thing that can release it,
@@ -256,6 +320,11 @@ export class OwnedSessionBridge implements OwnedAgentSink {
         break;
       case "commands":
         this.availableCommands = event.commands;
+        break;
+      case "mode":
+        this.currentMode = event.mode;
+        // A store write inside the provider's event dispatch, exactly like `model`.
+        this.persist(() => this.hooks.mode?.(event.mode));
         break;
       case "prose":
         this.assistantHistory += event.text;
@@ -342,6 +411,72 @@ export class OwnedSessionBridge implements OwnedAgentSink {
         }
         break;
     }
+  }
+
+  /** The mode picker: four options, which is the largest menu the glasses are known
+   *  to render. If a fourth mode is ever added this must page rather than grow —
+   *  eleven options were silently not drawn on a physical phone. */
+  private askMode(): void {
+    this.state = "awaiting";
+    this.interaction = { type: "mode" };
+    const wire = {
+      type: "user_question",
+      questions: [{
+        question: "Which mode should this session run in?",
+        header: "Mode",
+        options: [
+          ...AGENT_MODES.map((mode) => ({
+            label: `${MODE_LABEL[mode]}${mode === this.currentMode ? CURRENT_MARK : ""}`,
+            description: MODE_BLURB[mode],
+          })),
+          { label: CANCEL, description: "Leave the mode unchanged." },
+        ],
+      }],
+      toolUseId: `owned-mode:${this.id}`,
+    };
+    this.pendingWire = wire;
+    this.out.event(wire);
+  }
+
+  private async answerMode(answer: string): Promise<void> {
+    const value = parseAnswer(answer).trim();
+    this.interaction = null;
+    this.pendingWire = null;
+    emit(this.id, { type: "question_answer", answers: { answer: value } });
+    if (!value || value.toLowerCase() === CANCEL.toLowerCase()) {
+      await this.finishTurn(true, "Mode unchanged.", true, 0);
+      return;
+    }
+    // The label carries the current-mode mark, so compare on its leading word only.
+    const wanted = value.split("·")[0].trim().toLowerCase();
+    const mode = AGENT_MODES.find((candidate) => MODE_LABEL[candidate].toLowerCase() === wanted);
+    if (!mode) {
+      // Re-ask rather than guess: an unmatched answer means the app sent something
+      // that was never offered, and picking a mode anyway could widen permissions.
+      this.askMode();
+      return;
+    }
+    await this.applyMode(mode);
+  }
+
+  /** Runs inside the turn `prompt()` opened, so every exit terminalizes — including
+   *  the failure path, which reports rather than throws: the phone's POST has long
+   *  since returned and a notification is the only surface left. */
+  private async applyMode(mode: AgentMode): Promise<void> {
+    this.state = "busy";
+    try {
+      await this.agent.setMode!(mode);
+    } catch (error) {
+      this.out.event({
+        type: "notification",
+        title: "Mode switching unavailable",
+        message: `${providerName(this.agentProvider)} did not change mode: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      await this.finishTurn(true, "Mode unchanged.", false, 0);
+      return;
+    }
+    this.out.event({ type: "notification", title: `Mode: ${MODE_LABEL[mode]}`, message: MODE_BLURB[mode] });
+    await this.finishTurn(true, `Mode: ${MODE_LABEL[mode]}`, false, 0);
   }
 
   /** Put a command question on the glasses. Wire-identical to a provider question —

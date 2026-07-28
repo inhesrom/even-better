@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { AGENT_MODES, type AgentMode } from "./owned-agent.js";
 import { resolveEvenBetterHome } from "./owned-config.js";
 import type { ProviderId } from "./session.js";
 
@@ -22,6 +23,11 @@ export interface RememberedSessionMetadata {
   updatedAt: string;
   lastUsedAt: string;
   firstPrompt?: string;
+  /** Absent on every record written before mode switching existed, and on any
+   *  session never switched — both mean the provider's own default, which is
+   *  Normal. Reapplied on each attach so a session put in Plan yesterday does not
+   *  quietly come back able to edit. */
+  mode?: AgentMode;
 }
 
 export interface StoredHistoryEntry {
@@ -68,6 +74,7 @@ function parseMetadata(value: unknown): RememberedSessionMetadata | null {
     || !isIsoDate(item.updatedAt)
     || !isIsoDate(item.lastUsedAt)
     || (item.firstPrompt !== undefined && typeof item.firstPrompt !== "string")
+    || (item.mode !== undefined && !AGENT_MODES.includes(item.mode as AgentMode))
   ) return null;
   return item as unknown as RememberedSessionMetadata;
 }

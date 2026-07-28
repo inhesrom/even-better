@@ -81,3 +81,21 @@ test("removal refuses a live lease and forgets only even-better state after rele
   store.remove(id);
   assert.equal(store.get(id), undefined);
 });
+
+test("the remembered mode round-trips, and an absent one still loads", () => {
+  const store = new OwnedSessionStore(path.join(scratch, "mode-state"));
+  const id = "owned:55555555-5555-4555-8555-555555555555";
+  // Every record written before mode switching existed lacks the field entirely.
+  store.save(metadata(id));
+  assert.equal(store.get(id)?.mode, undefined);
+
+  store.save({ ...metadata(id), mode: "plan" });
+  assert.equal(store.get(id)?.mode, "plan");
+
+  // A record whose mode is not one of the three is not a record we can act on:
+  // resuming it would apply a mode nothing maps.
+  const target = path.join(store.sessionsDir, id.slice("owned:".length), "metadata.json");
+  fs.writeFileSync(target, JSON.stringify({ ...metadata(id), mode: "yolo" }));
+  assert.equal(store.get(id), undefined);
+  assert.deepEqual(store.list(), []);
+});

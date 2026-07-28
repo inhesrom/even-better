@@ -97,20 +97,25 @@ type FactoryParams = {
  * eagerly at spawn. A fake that announces init up front hides the startup deadlock this
  * adapter was rewritten to avoid.
  */
-function fakeQueryFactory(): {
+function fakeQueryFactory(initialMode = "default"): {
   factory: typeof queryFunction;
   permissions: PermissionResult[];
   resumes: Array<string | undefined>;
   sessionIds: Array<string | undefined>;
+  modes: string[];
+  startMode: () => string | undefined;
   closeCount: () => number;
 } {
   const permissions: PermissionResult[] = [];
   const resumes: Array<string | undefined> = [];
   const sessionIds: Array<string | undefined> = [];
+  const modes: string[] = [];
+  let startMode: string | undefined;
   let closed = 0;
   const factory = ((params: FactoryParams) => {
     resumes.push(params.options?.resume);
     sessionIds.push(params.options?.sessionId);
+    startMode = params.options?.permissionMode;
     const stream = new MessageStream();
     let interrupted = false;
     let announced = false;
@@ -123,12 +128,27 @@ function fakeQueryFactory(): {
             type: "system",
             subtype: "init",
             model: "fake-claude-model",
+            permissionMode: initialMode,
             session_id: params.options?.resume ?? params.options?.sessionId ?? "private-session",
             uuid: "init",
           }));
         }
         const content = message.message.content;
         const prompt = typeof content === "string" ? content : "";
+        if (prompt === "plan-ready") {
+          stream.push(sdkMessage({
+            type: "assistant",
+            message: { content: [{ type: "tool_use", id: "plan-tool", name: "ExitPlanMode", input: { plan: "Do the thing" } }] },
+          }));
+          const decision = await params.options!.canUseTool!(
+            "ExitPlanMode",
+            { plan: "Do the thing" },
+            { signal: new AbortController().signal, toolUseID: "plan-tool", requestId: "plan-request", title: "Claude is ready to code" },
+          );
+          if (decision) permissions.push(decision);
+          stream.push(result(true));
+          continue;
+        }
         if (prompt === "hang") {
           while (!interrupted) await new Promise((resolve) => setTimeout(resolve, 5));
           continue;
@@ -223,6 +243,9 @@ function fakeQueryFactory(): {
       throw: async (error: unknown) => { throw error; },
       [Symbol.asyncIterator]() { return this; },
       initializationResult: async () => ({ models: [], commands: [], agents: [], output_style: "", available_output_styles: [], account: {} }) as SDKControlInitializeResponse,
+      setPermissionMode: async (mode: string) => {
+        modes.push(mode);
+      },
       interrupt: async () => {
         interrupted = true;
         stream.push(result(false, true));
@@ -235,7 +258,7 @@ function fakeQueryFactory(): {
     };
     return handle as unknown as Query;
   }) as typeof queryFunction;
-  return { factory, permissions, resumes, sessionIds, closeCount: () => closed };
+  return { factory, permissions, resumes, sessionIds, modes, startMode: () => startMode, closeCount: () => closed };
 }
 
 /** A child that writes to stderr and never completes the control handshake. */
@@ -448,6 +471,96 @@ test("local command output and compaction are visible on the glasses", async () 
     const notice = await waitFor(sink, "notification");
     assert.match(notice.type === "notification" ? notice.message : "", /41,000.*9,000/);
     await waitFor(sink, "result");
+  } finally {
+    await agent.dispose();
+  }
+});
+
+test("a mode switch is a control request, reported back as a neutral mode", async () => {
+  const fake = fakeQueryFactory();
+  const sink = new Sink();
+  const agent = new ClaudeOwnedAgent(cwd, config, fake.factory);
+  try {
+    await agent.start(sink);
+    await agent.setMode("plan");
+    await agent.setMode("auto");
+    // Auto is deliberately acceptEdits, not bypassPermissions: on glasses you cannot
+    // read a command before it runs.
+    assert.deepEqual(fake.modes, ["plan", "acceptEdits"]);
+    assert.deepEqual(
+      sink.events.filter((event) => event.type === "mode").map((event) => event.type === "mode" && event.mode),
+      ["plan", "auto"],
+    );
+  } finally {
+    await agent.dispose();
+  }
+});
+
+// The mode Claude reports is the truth, including one it reached without us — and
+// like the model it rides on system/init, which arrives only once a turn begins.
+test("the mode is late-bound from system/init and maps onto the neutral set", async () => {
+  for (const [native, neutral] of [["plan", "plan"], ["acceptEdits", "auto"], ["bypassPermissions", "auto"]] as const) {
+    const sink = new Sink();
+    const agent = new ClaudeOwnedAgent(cwd, config, fakeQueryFactory(native).factory);
+    try {
+      await agent.start(sink);
+      assert.equal(sink.count("mode"), 0, "system/init has not arrived yet");
+      await agent.prompt("inspect");
+      const event = await waitFor(sink, "mode");
+      // bypassPermissions has no neutral name; calling it "Normal" would understate the
+      // risk in the one direction that matters, so it reads as Auto.
+      assert.equal(event.type === "mode" && event.mode, neutral);
+    } finally {
+      await agent.dispose();
+    }
+  }
+});
+
+test("a ready plan offers the mode fork, and approving carries the switch", async () => {
+  const fake = fakeQueryFactory("plan");
+  const sink = new Sink();
+  const agent = new ClaudeOwnedAgent(cwd, config, fake.factory);
+  try {
+    await agent.start(sink);
+    await agent.prompt("plan-ready");
+    const request = await waitFor(sink, "permission");
+    assert.equal(request.type === "permission" && request.toolName, "ExitPlanMode");
+    assert.deepEqual(
+      request.type === "permission" ? request.options.map((option) => option.key) : [],
+      ["planAuto", "planNormal", "planKeep"],
+    );
+
+    await agent.respondPermission("planAuto");
+    await waitFor(sink, "result");
+    // The approval itself carries the mode change; there is no second round trip.
+    assert.deepEqual(fake.permissions, [{
+      behavior: "allow",
+      updatedInput: { plan: "Do the thing" },
+      updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+    }]);
+    const mode = await waitFor(sink, "mode", 2);
+    assert.equal(mode.type === "mode" && mode.mode, "auto");
+  } finally {
+    await agent.dispose();
+  }
+});
+
+test("keeping the plan denies the tool and leaves the session in plan mode", async () => {
+  const fake = fakeQueryFactory("plan");
+  const sink = new Sink();
+  const agent = new ClaudeOwnedAgent(cwd, config, fake.factory);
+  try {
+    await agent.start(sink);
+    await agent.prompt("plan-ready");
+    await waitFor(sink, "permission");
+    await agent.respondPermission("planKeep");
+    await waitFor(sink, "result");
+    assert.equal(fake.permissions[0]?.behavior, "deny");
+    // Nothing changed the mode, so the only report is still plan mode from system/init.
+    assert.deepEqual(
+      sink.events.filter((event) => event.type === "mode").map((event) => event.type === "mode" && event.mode),
+      ["plan"],
+    );
   } finally {
     await agent.dispose();
   }

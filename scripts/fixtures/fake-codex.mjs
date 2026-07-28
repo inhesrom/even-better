@@ -19,8 +19,36 @@ function response(id, result) {
   send({ id, result });
 }
 
+function error(id, message) {
+  send({ id, error: { code: -32600, message } });
+}
+
 function notify(method, params) {
   send({ method, params });
+}
+
+// Mirrors the measured 0.145.0 behaviour: `sandboxPolicy` is the tagged object the
+// runtime update takes, and the change is confirmed by a notification carrying the
+// whole settings block. FAKE_CODEX_NO_COLLAB stands in for a CLI that does not know
+// collaborationMode, which is how the adapter's narrower retry gets exercised.
+const threadSettings = {
+  model: "fake-codex-model",
+  approvalPolicy: "on-request",
+  sandboxPolicy: { type: "workspaceWrite" },
+  collaborationMode: { mode: "default", settings: { model: "fake-codex-model" } },
+};
+
+function settingsUpdate(message) {
+  const params = message.params ?? {};
+  if (params.collaborationMode && process.env.FAKE_CODEX_NO_COLLAB === "1") {
+    error(message.id, "unknown field `collaborationMode`");
+    return;
+  }
+  for (const field of ["approvalPolicy", "sandboxPolicy", "collaborationMode", "model"]) {
+    if (params[field] !== undefined) threadSettings[field] = params[field];
+  }
+  response(message.id, {});
+  notify("thread/settings/updated", { threadId: "fake-thread", threadSettings });
 }
 
 function permissionFlow() {
@@ -155,6 +183,10 @@ function handle(message) {
       modelProvider: "openai",
       cwd: process.cwd(),
     });
+    return;
+  }
+  if (message.method === "thread/settings/update") {
+    settingsUpdate(message);
     return;
   }
   if (message.method === "turn/start") {

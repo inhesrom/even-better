@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   query,
   type CanUseTool,
+  type PermissionMode,
   type PermissionResult,
   type PermissionUpdate,
   type Query,
@@ -9,12 +10,41 @@ import {
   type SDKUserMessage,
   type SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo, OwnedCommand, OwnedQuestion } from "./owned-agent.js";
+import type {
+  AgentMode,
+  OwnedAgent,
+  OwnedAgentSink,
+  OwnedAgentStartInfo,
+  OwnedCommand,
+  OwnedQuestion,
+} from "./owned-agent.js";
 import type { OwnedProviderConfig } from "./owned-config.js";
 
 type CanUseToolOptions = Parameters<CanUseTool>[2];
 
 const STDERR_TAIL_LIMIT = 4_000;
+
+/** The tool Claude calls when a plan is ready; approving it is also the moment
+ *  the execution mode is chosen. */
+const EXIT_PLAN_MODE = "ExitPlanMode";
+
+const NATIVE_MODE: Record<AgentMode, PermissionMode> = {
+  plan: "plan",
+  // Deliberately `acceptEdits`, not `bypassPermissions`: on glasses you cannot read
+  // a command before it runs, so silent arbitrary shell execution is too much trust.
+  auto: "acceptEdits",
+  normal: "default",
+};
+
+/** Total by design, closest-neighbour for the modes we never set ourselves. A
+ *  user's own settings can start a session in `bypassPermissions`/`dontAsk`/`auto`,
+ *  and reporting any of those as "Normal" would understate the risk in the one
+ *  direction that matters — they all mean "do not ask about edits", which is Auto. */
+function neutralMode(mode: PermissionMode): AgentMode {
+  if (mode === "plan") return "plan";
+  if (mode === "default") return "normal";
+  return "auto";
+}
 
 interface PendingPermission {
   kind: "permission";
@@ -23,6 +53,9 @@ interface PendingPermission {
   description: string;
   input: Record<string, unknown>;
   suggestions: PermissionUpdate[];
+  /** ExitPlanMode: the menu is the mode decision, so the answer carries a
+   *  `setMode` permission update instead of a plain allow. */
+  planReady: boolean;
   resolve: (result: PermissionResult) => void;
 }
 
@@ -173,6 +206,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
   private stderrTail = "";
   private active = false;
   private disposed = false;
+  private currentMode: AgentMode = "normal";
 
   constructor(
     readonly cwd: string,
@@ -226,6 +260,21 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     return this.availableCommands;
   }
 
+  /** A control request, legal only in streaming-input mode — which is the mode this
+   *  agent always runs in (`prompt` is the MessageQueue). */
+  async setMode(mode: AgentMode): Promise<void> {
+    if (this.disposed || !this.queryHandle) throw new Error("Claude session ended; create another session.");
+    await timeout(
+      this.queryHandle.setPermissionMode(NATIVE_MODE[mode]),
+      this.config.cancelTimeoutMs,
+      "Claude did not acknowledge the mode change.",
+    );
+    // The SDK reports the mode again on the next system/init; until then this is the
+    // only confirmation there is, and it is a confirmation — setPermissionMode
+    // resolves after the CLI applies it.
+    this.reportMode(NATIVE_MODE[mode]);
+  }
+
   prompt(text: string): Promise<void> {
     if (this.disposed || !this.queryHandle) throw new Error("Claude session ended; create another session.");
     if (this.active) throw new Error("Claude is already processing a prompt.");
@@ -242,6 +291,11 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     const pending = this.interactions[0];
     if (!pending || pending.kind !== "permission") return Promise.reject(new Error("No matching Claude permission."));
     this.interactions.shift();
+    if (pending.planReady) {
+      this.resolvePlan(pending, decision);
+      this.presentHead();
+      return Promise.resolve();
+    }
     if (decision === "allow" || decision === "allowAlways") {
       pending.resolve({
         behavior: "allow",
@@ -327,6 +381,7 @@ export class ClaudeOwnedAgent implements OwnedAgent {
             description: options.title || options.displayName || readable(input),
             input,
             suggestions: options.suggestions ?? [],
+            planReady: toolName === EXIT_PLAN_MODE,
             resolve,
           };
       this.interactions.push(pending);
@@ -351,9 +406,50 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     if (head) this.present(head);
   }
 
+  /** The plan-ready fork. Options 1 and 2 accept the plan and carry the mode
+   *  execution runs in; option 3 denies, which leaves the session in Plan mode
+   *  because nothing changed it. */
+  private resolvePlan(pending: PendingPermission, decision: string): void {
+    if (decision === "planKeep") {
+      pending.resolve({ behavior: "deny", message: "Keep planning; the plan was not approved." });
+      return;
+    }
+    const mode: AgentMode = decision === "planAuto" ? "auto" : "normal";
+    pending.resolve({
+      behavior: "allow",
+      updatedInput: pending.input,
+      updatedPermissions: [{ type: "setMode", mode: NATIVE_MODE[mode], destination: "session" }],
+    });
+    // The CLI applies the update as it accepts the tool result, and no system/init
+    // follows inside the same turn — so this is the only place the switch is known.
+    this.reportMode(NATIVE_MODE[mode]);
+  }
+
+  private reportMode(mode: PermissionMode): void {
+    const neutral = neutralMode(mode);
+    if (neutral === this.currentMode) return;
+    this.currentMode = neutral;
+    this.sink?.event({ type: "mode", mode: neutral });
+  }
+
   private present(pending: PendingInteraction): void {
     if (pending.kind === "question") {
       this.emitQuestion(pending);
+      return;
+    }
+    if (pending.planReady) {
+      this.sink?.event({
+        type: "permission",
+        id: `claude-plan:${pending.toolUseId}`,
+        toolId: pending.toolUseId,
+        toolName: pending.toolName,
+        description: pending.description,
+        options: [
+          { key: "planAuto", label: "Approve & auto" },
+          { key: "planNormal", label: "Approve, ask each step" },
+          { key: "planKeep", label: "Keep planning" },
+        ],
+      });
       return;
     }
     const sessionSuggestion = pending.suggestions.some((suggestion) => "destination" in suggestion && suggestion.destination === "session");
@@ -405,6 +501,10 @@ export class ClaudeOwnedAgent implements OwnedAgent {
     if (message.type === "system" && message.subtype === "init") {
       // Arrives with turn one; the catalog persists it over the placeholder from start().
       this.sink.event({ type: "model", model: message.model });
+      // Late-bound like the model, and for the same reason: init is the first place
+      // the CLI reports either. This is also how a mode Claude changed on its own
+      // (a plan self-exit) reaches the glasses.
+      this.reportMode(message.permissionMode);
       return;
     }
     if (message.type === "system" && message.subtype === "commands_changed") {

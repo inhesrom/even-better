@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo } from "../src/owned-agent.js";
+import type { AgentMode, OwnedAgent, OwnedAgentSink, OwnedAgentStartInfo } from "../src/owned-agent.js";
 import type { ProviderId } from "../src/session.js";
 
 // The bridge reads its pacing at load, and these tests drain a whole turn.
@@ -275,4 +275,159 @@ test("interrupting a command question releases the session", async () => {
     await bridge.prompt("carry on");
     assert.deepEqual(agent.prompts, ["carry on"]);
   });
+});
+
+/** A stub that can switch modes, and reports provider truth the way a real adapter
+ *  does — the bridge must never mark the picker from what it merely requested. */
+class ModeAgent extends StubAgent {
+  applied: AgentMode[] = [];
+  failWith: string | null = null;
+
+  setMode(mode: AgentMode): Promise<void> {
+    if (this.failWith) return Promise.reject(new Error(this.failWith));
+    this.applied.push(mode);
+    this.sink?.event({ type: "mode", mode });
+    return Promise.resolve();
+  }
+}
+
+async function modeBridge(
+  id: string,
+  run: (bridge: InstanceType<typeof OwnedSessionBridge>, agent: ModeAgent, modes: AgentMode[]) => Promise<void>,
+): Promise<void> {
+  const agent = new ModeAgent();
+  const modes: AgentMode[] = [];
+  const bridge = new OwnedSessionBridge(id, agent, { mode: (mode) => modes.push(mode) });
+  await bridge.start();
+  try {
+    await run(bridge, agent, modes);
+  } finally {
+    await bridge.dispose();
+  }
+}
+
+test("a spoken mode switch applies it, says so, and ends the turn", async () => {
+  const id = "owned:mode-switch";
+  await modeBridge(id, async (bridge, agent, modes) => {
+    await bridge.prompt("change to auto mode");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.applied, ["auto"]);
+    // Never sent to the provider as text: this is a capability call, not a prompt.
+    assert.deepEqual(agent.prompts, []);
+    assert.deepEqual(modes, ["auto"], "the confirmed mode was not persisted");
+    assert.ok(typesOf(id).includes("notification"));
+    assert.ok(typesOf(id).includes("result"));
+
+    // The session still takes ordinary work afterwards.
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+});
+
+test("a bare mode request opens a four-option picker marked with the current mode", async () => {
+  const id = "owned:mode-menu";
+  await modeBridge(id, async (bridge, agent) => {
+    await bridge.prompt("mode");
+    await waitFor("the picker", () => typesOf(id).includes("user_question"));
+    assert.equal(bridge.state, "awaiting");
+    const options = lastQuestion(id).options.map((option) => option.label);
+    // Four is the largest menu the glasses are known to render; eleven silently did not.
+    assert.deepEqual(options, ["Plan", "Normal · current", "Auto", "Cancel"]);
+    assert.deepEqual(agent.applied, []);
+
+    await bridge.respondQuestion("Plan");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.applied, ["plan"]);
+
+    // The mark follows provider truth, so the next picker shows the new mode.
+    await bridge.prompt("mode");
+    await waitFor("the second picker", () => bridge.state === "awaiting");
+    assert.deepEqual(lastQuestion(id).options.map((option) => option.label), [
+      "Plan · current",
+      "Normal",
+      "Auto",
+      "Cancel",
+    ]);
+    await bridge.respondQuestion("Cancel");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.applied, ["plan"], "cancelling must not switch anything");
+  });
+});
+
+// The mode question rides the same turn machinery as a command question, so the same
+// invariant applies: every exit terminalizes or the session is wedged for good.
+test("cancelling or interrupting the mode picker leaves the session usable", async () => {
+  await modeBridge("owned:mode-cancel", async (bridge, agent) => {
+    await bridge.prompt("mode");
+    await waitFor("the picker", () => bridge.state === "awaiting");
+    await bridge.respondQuestion("Cancel");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+
+  await modeBridge("owned:mode-interrupt", async (bridge, agent) => {
+    await bridge.prompt("mode");
+    await waitFor("the picker", () => bridge.state === "awaiting");
+    await bridge.interrupt();
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.applied, []);
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+});
+
+test("a provider that cannot switch reports it and still ends the turn", async () => {
+  const id = "owned:mode-unavailable";
+  await modeBridge(id, async (bridge, agent, modes) => {
+    agent.failWith = "Unknown method thread/settings/update";
+    await bridge.prompt("switch to plan mode");
+    await waitFor("the turn to close", () => bridge.state === "idle");
+    assert.deepEqual(agent.applied, []);
+    assert.deepEqual(modes, [], "a failed switch must not be persisted");
+    assert.ok(typesOf(id).includes("notification"));
+    await bridge.prompt("carry on");
+    assert.deepEqual(agent.prompts, ["carry on"]);
+  });
+});
+
+// Grok today, and any provider whose CLI cannot switch: the text is an ordinary
+// prompt and must reach the agent byte-identical.
+test("a provider without the capability passes mode phrasing straight through", async () => {
+  const agent = new StubAgent();
+  const bridge = new OwnedSessionBridge("owned:mode-nocap", agent);
+  await bridge.start();
+  await bridge.prompt("change to auto mode");
+  assert.deepEqual(agent.prompts, ["change to auto mode"]);
+  await bridge.dispose();
+});
+
+test("a remembered mode is reapplied when the session attaches", async () => {
+  const agent = new ModeAgent();
+  const bridge = new OwnedSessionBridge("owned:mode-restore", agent);
+  await bridge.start("native-stub", "plan");
+  assert.deepEqual(agent.applied, ["plan"]);
+  await bridge.dispose();
+
+  // Normal is what every provider already starts in, so restoring it is a no-op
+  // rather than an extra control round trip on every attach.
+  const fresh = new ModeAgent();
+  const plain = new OwnedSessionBridge("owned:mode-restore-normal", fresh);
+  await plain.start("native-stub", "normal");
+  assert.deepEqual(fresh.applied, []);
+  await plain.dispose();
+});
+
+// Failing to restore a mode must not fail the attach: the row would be stranded with
+// no session at all, which is strictly worse than a session in the wrong mode.
+test("a session whose mode cannot be restored still opens", async () => {
+  const agent = new ModeAgent();
+  agent.failWith = "Claude did not acknowledge the mode change.";
+  const id = "owned:mode-restore-fail";
+  const bridge = new OwnedSessionBridge(id, agent);
+  const info = await bridge.start("native-stub", "plan");
+  assert.equal(info.nativeSessionId, "native-stub");
+  await bridge.prompt("carry on");
+  assert.deepEqual(agent.prompts, ["carry on"]);
+  await bridge.dispose();
 });
