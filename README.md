@@ -99,6 +99,12 @@ wizard makes both real selections. See [docs/OWNED.md](docs/OWNED.md).
   ＋ Pick up session row; adopting it resumes the same native session on the
   glasses. Close the terminal copy first — and hand back later with
   `claude --resume`.
+- **Modes switch by voice.** Say "change to auto mode" — or just "mode" for a
+  picker — and an owned Claude or Codex session moves between **Plan** (research
+  only), **Normal** (ask first) and **Auto** (edits apply unprompted). The choice
+  is remembered per session, and when Claude finishes a plan the approval itself
+  chooses what execution runs as. Only a prompt that is *entirely* one of the
+  recognized phrasings switches anything.
 - **Structured output.** Mux mode reads Claude/Codex session transcripts as its
   source of truth; Grok mode consumes validated ACP frames. Neither coding-agent
   path screen-scrapes prose. (A fresh mux agent streams no content until its
