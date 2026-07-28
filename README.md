@@ -94,6 +94,11 @@ wizard makes both real selections. See [docs/OWNED.md](docs/OWNED.md).
 - **Owned sessions are durable.** The default source remembers each public ID,
   provider, directory, display history, and native resume ID. Provider and
   directory stay fixed for that session.
+- **Terminal sessions can be picked up.** A recent `claude` or `codex` session
+  started in a plain terminal (inside `WORKSPACE_ROOTS`) appears under a
+  ＋ Pick up session row; adopting it resumes the same native session on the
+  glasses. Close the terminal copy first — and hand back later with
+  `claude --resume`.
 - **Structured output.** Mux mode reads Claude/Codex session transcripts as its
   source of truth; Grok mode consumes validated ACP frames. Neither coding-agent
   path screen-scrapes prose. (A fresh mux agent streams no content until its
@@ -117,6 +122,7 @@ Everything is optional — `even-better` works with no flags.
 | `MAX_OWNED_SESSIONS` | `6` | Maximum attached owned-agent processes; remembered sessions are not capped — delete them from the ＋ Manage sessions row or `even-better sessions remove` |
 | `WIZARD_DIRECTORY_LIMIT` | `0` | Options in the wizard's directory question; `0` offers every eligible directory |
 | `MANAGE_SESSION_LIMIT` | `4` | Sessions per page in the ＋ Manage sessions delete question. Unlike the directory question this has no unlimited: an eleven-option menu did not render on a physical phone, so the menu always pages |
+| `PICKUP_SESSION_LIMIT` | `4` | Sessions per page in the ＋ Pick up session question; pages for the same measured reason as `MANAGE_SESSION_LIMIT` |
 | `SETUP_QUESTION_DELAY_MS` | `500` | Delay before the wizard's first question after a stream opens; the app drops one sent in the same tick (ADR 0005) |
 | `CLAUDE_BIN` | `claude` | Claude executable name or path; missing executables are omitted from the owned wizard |
 | `CODEX_BIN` | `codex` | Codex executable name or path; missing executables are omitted from the owned wizard |

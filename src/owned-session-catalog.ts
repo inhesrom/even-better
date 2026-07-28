@@ -7,8 +7,14 @@ import type { GrokConfig } from "./grok-config.js";
 import type { OwnedAgent, OwnedAgentStartInfo } from "./owned-agent.js";
 import { parseAnswer } from "./owned-commands.js";
 import type { OwnedConfig, OwnedProviderConfig } from "./owned-config.js";
+import {
+  ExternalSessionDiscovery,
+  type ExternalSessionCandidate,
+  type ExternalSessionSource,
+} from "./owned-discovery.js";
 import { compactPrompt, providerLabel } from "./owned-format.js";
 import { OwnedManageSession } from "./owned-manage-session.js";
+import { OwnedPickupSession } from "./owned-pickup-session.js";
 import { deferRowQuestion, primeRow } from "./owned-row-question.js";
 import { OwnedSessionBridge } from "./owned-session-bridge.js";
 import {
@@ -407,6 +413,15 @@ class OwnedCatalogSession implements LiveSession {
     this.save(true);
   }
 
+  /** Fire-and-forget resume for a just-adopted session: the provider child
+   *  spawns while the user starts talking, so the first prompt lands on a live
+   *  bridge (wizard parity). Runs the ordinary ensureAttached path — a prompt
+   *  spoken meanwhile coalesces onto the in-flight attach, and failure surfaces
+   *  through its could-not-resume notification. */
+  warmUp(): void {
+    void this.ensureAttached(false).catch(() => undefined);
+  }
+
   private async ensureAttached(forPrompt: boolean): Promise<OwnedSessionBridge> {
     if (this.bridge) {
       this.touch();
@@ -679,6 +694,8 @@ export class OwnedSessionCatalog implements SessionCatalog {
   readonly store: OwnedSessionStore;
   private readonly sessions = new Map<string, OwnedCatalogSession>();
   private manager: OwnedManageSession | null = null;
+  private pickup: OwnedPickupSession | null = null;
+  private pickupProbe: Promise<void> | null = null;
   private disposed = false;
   private attachmentTail: Promise<void> = Promise.resolve();
 
@@ -686,6 +703,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
     readonly config: OwnedConfig,
     private readonly factory: AgentFactory = defaultAgentFactory,
     store: OwnedSessionStore = new OwnedSessionStore(config.homeDir),
+    private readonly source: ExternalSessionSource = new ExternalSessionDiscovery(config.workspaces),
   ) {
     this.store = store;
     for (const record of store.list()) {
@@ -704,6 +722,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
   async list(): Promise<SessionDescriptor[]> {
     this.ensureLauncher();
     this.ensureManager();
+    this.ensurePickup();
     const sessions = [...this.sessions.values()];
     sessions.sort((a, b) => {
       if (a.agentProvider === undefined && b.agentProvider !== undefined) return -1;
@@ -711,19 +730,23 @@ export class OwnedSessionCatalog implements SessionCatalog {
       return b.lastUsedMs - a.lastUsedMs;
     });
     const rows = await Promise.all(sessions.map((session) => session.describe()));
-    // Both synthetic rows sort ahead of remembered ones; between themselves the
-    // order is fixed here rather than left to Map insertion surviving the sort,
-    // so the list does not reshuffle its top two rows between polls.
-    if (this.manager) {
+    // Synthetic rows sort ahead of remembered ones; between themselves the order
+    // is fixed here (wizard, manage, pickup) rather than left to Map insertion
+    // surviving the sort, so the top of the list never reshuffles between polls.
+    const extras: SessionDescriptor[] = [];
+    if (this.manager) extras.push(await this.manager.describe());
+    if (this.pickup) extras.push(await this.pickup.describe());
+    if (extras.length) {
       const wizards = rows.filter((row) => row.agentProvider === undefined);
       const remembered = rows.filter((row) => row.agentProvider !== undefined);
-      return [...wizards, await this.manager.describe(), ...remembered];
+      return [...wizards, ...extras, ...remembered];
     }
     return rows;
   }
 
   get(id: string): Promise<LiveSession | undefined> {
     if (this.manager && id === this.manager.id) return Promise.resolve(this.manager);
+    if (this.pickup && id === this.pickup.id) return Promise.resolve(this.pickup);
     return Promise.resolve(this.sessions.get(id));
   }
 
@@ -763,6 +786,134 @@ export class OwnedSessionCatalog implements SessionCatalog {
     }
   }
 
+  /** External CLI sessions the user could pick up right now, newest first.
+   *  Discovery failures yield [] — the row goes quiet; list() never fails. */
+  async adoptable(fresh = false): Promise<ExternalSessionCandidate[]> {
+    if (this.disposed) return [];
+    // A provider whose binary is missing cannot attach, and adopting a session
+    // that can never resume is a trap — its candidates are not offered.
+    const providers = (["claude", "codex"] as const).filter(
+      (provider) => this.config.providers[provider] !== undefined,
+    );
+    if (!providers.length) return [];
+    let found: ExternalSessionCandidate[];
+    try {
+      found = await this.source.candidates(providers, fresh);
+    } catch {
+      return [];
+    }
+    // Dedupe against the store on disk, not the in-memory map: a remembered
+    // record whose cwd fell outside the roots is skipped by the constructor but
+    // still stored, and adopting it again would put two owned rows on one native
+    // session. This also excludes every session even-better itself created,
+    // since owned children share the user's real ~/.claude and ~/.codex.
+    const known = new Set(this.store.list().map((record) => record.nativeSessionId));
+    return found.filter((candidate) => !known.has(candidate.nativeSessionId));
+  }
+
+  /** Takeover-by-resume: synthesize a remembered record whose nativeSessionId is
+   *  the external session's id and resume it through the ordinary attach path
+   *  (Claude `resume:`, Codex `thread/resume`). With `takeOver` — the pickup row
+   *  itself — the record takes that row's public id, the same promote-in-place
+   *  `launch()` performs for the wizard: the phone's open stream carries straight
+   *  into the adopted session, and a fire-and-forget warm-up starts the resume
+   *  while the user speaks. The confirm POST never waits on the spawn. */
+  async adopt(
+    candidate: ExternalSessionCandidate,
+    takeOver?: OwnedPickupSession,
+  ): Promise<{ id: string; title: string }> {
+    if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
+    if (!this.config.providers[candidate.agentProvider]) {
+      throw new SessionControlError(
+        `${providerLabel(candidate.agentProvider)} is unavailable. Install it or set its *_BIN path, then restart even-better.`,
+        503,
+      );
+    }
+    // Re-checked against the store, not only in adoptable(): a menu can sit open
+    // for minutes, and a stale menu re-emitted after a reconnect races the first
+    // answer's adopt.
+    if (this.store.list().some((record) => record.nativeSessionId === candidate.nativeSessionId)) {
+      throw new SessionControlError("That session was already picked up.", 409);
+    }
+    let cwd: string;
+    try {
+      // resolve() with no displayed list canonicalizes the absolute path and
+      // enforces WORKSPACE_ROOTS — the CLI-recorded cwd is as untrusted as a
+      // phone-supplied one.
+      cwd = this.config.workspaces.resolve(candidate.cwd, []);
+    } catch (error) {
+      const message = error instanceof WorkspaceConfigError ? error.message : String(error);
+      throw new SessionControlError(message, 409);
+    }
+    const inspection = await this.source.inspect(candidate);
+    if (!inspection) {
+      throw new SessionControlError("That session's transcript is gone; it may have been deleted.", 409);
+    }
+    // Re-checked after the await: a dispose() landing during inspect must not
+    // save a record and mint a live session after shutdown — the same
+    // promote-after-dispose hazard attachNow re-checks.
+    if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
+    // From store.save through the handoff below nothing awaits, so no request
+    // can observe a half-swapped catalog.
+    const handingOff = takeOver !== undefined && this.pickup === takeOver;
+    const now = new Date().toISOString();
+    const record: RememberedSessionMetadata = {
+      version: 1,
+      id: handingOff ? takeOver.id : `owned:${randomUUID()}`,
+      agentProvider: candidate.agentProvider,
+      cwd,
+      nativeSessionId: candidate.nativeSessionId,
+      model: inspection.model || "Unknown",
+      createdAt: now,
+      updatedAt: now,
+      // Now, not the transcript's mtime: the fresh pickup belongs at the top of
+      // the phone's list.
+      lastUsedAt: now,
+      ...(inspection.firstPrompt ? { firstPrompt: compactPrompt(inspection.firstPrompt, 200) } : {}),
+    };
+    // Saved before the map entry so a crash between the two restores the row on
+    // the next boot instead of losing the adoption.
+    try {
+      this.store.save(record);
+    } catch (error) {
+      if (error instanceof OwnedSessionStoreError) throw new SessionControlError(error.message, 409);
+      throw error;
+    }
+    const session = new OwnedCatalogSession(record.id, this, record);
+    this.sessions.set(record.id, session);
+    try {
+      session.installLease(this.store.acquireLease(record.id));
+    } catch {
+      // The id was minted this boot (by ensurePickup or just above) and the
+      // pickup row never leases, so EEXIST is impossible; a filesystem failure
+      // surfaces when the row is opened, same as the restore loop.
+    }
+    this.config.workspaces.touch(cwd, Date.parse(now));
+    if (handingOff) {
+      // The map entry is already in place, so get(record.id) resolves to the
+      // adopted session the moment the pickup reference drops. handOff() only
+      // clears the row's question timer — dispose() would dropSession() and end
+      // the stream the phone is watching. Emissions happen here, not in the
+      // pickup row, mirroring where launch() emits its promote frames.
+      this.pickup = null;
+      takeOver.handOff();
+      emit(record.id, {
+        type: "status",
+        state: "idle",
+        sessionId: record.id,
+        provider: "codex",
+        agentProvider: record.agentProvider,
+      });
+      emit(record.id, {
+        type: "notification",
+        title: "Session picked up",
+        message: `Say your prompt to continue where the terminal left off. ${providerLabel(record.agentProvider)} is resuming in ${path.basename(cwd || "/")}.`,
+      });
+      session.warmUp();
+    }
+    return { id: record.id, title: session.rowTitle };
+  }
+
   async default(): Promise<LiveSession | undefined> {
     if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
     return this.createSetup();
@@ -788,6 +939,8 @@ export class OwnedSessionCatalog implements SessionCatalog {
     this.disposed = true;
     this.manager?.dispose();
     this.manager = null;
+    this.pickup?.dispose();
+    this.pickup = null;
     const sessions = [...this.sessions.values()];
     await Promise.allSettled(sessions.map((session) => session.dispose()));
   }
@@ -812,6 +965,25 @@ export class OwnedSessionCatalog implements SessionCatalog {
     if (this.disposed || this.manager) return;
     if (!this.deletable(1).length) return;
     this.manager = new OwnedManageSession(`owned:${randomUUID()}`, this);
+  }
+
+  /** The pickup row appears once at least one adoptable external session exists.
+   *  The probe is fire-and-forget so list() never waits on a filesystem scan —
+   *  the row simply appears on a later poll once discovery lands. Like the
+   *  manage row it is never torn down again (dropping a row `res.end()`s the
+   *  phone's stream); with nothing left to adopt it says so instead. */
+  private ensurePickup(): void {
+    if (this.disposed || this.pickup || this.pickupProbe) return;
+    this.pickupProbe = this.adoptable()
+      .then((candidates) => {
+        if (!this.disposed && !this.pickup && candidates.length) {
+          this.pickup = new OwnedPickupSession(`owned:${randomUUID()}`, this);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        this.pickupProbe = null;
+      });
   }
 
   private createSetup(): OwnedCatalogSession {

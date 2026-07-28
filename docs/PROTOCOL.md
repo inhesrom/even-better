@@ -181,15 +181,32 @@ labelled `<n> · Agent · folder`, plus **More sessions…** when a page remains
 Deleting ends that session's SSE stream, so the app sees the row disappear on its
 next `/api/sessions` poll.
 
+A third synthetic row, **＋ Pick up session**, appears once a recent terminal
+`claude`/`codex` session is adoptable (ADR 0007) and sorts after the manage row.
+Its questions are `owned-pickup:<id>:pick` (candidates newest-first, labelled
+`<n> · Agent · folder · excerpt` — the session's title or first prompt, so two
+sessions in one directory read apart — with an `Active <age> · branch`
+description, plus **More sessions…** / **Cancel**) and
+`owned-pickup:<id>:confirm` (**Pick up here** / **Keep in terminal**). Confirming adopts **in place**: the row's own id becomes
+the remembered session (the wizard's promote-in-place), the open stream receives
+`status: idle` plus a **Session picked up** notification telling the user to
+speak, and the provider begins resuming in the background immediately. The next
+`/api/sessions` poll shows the same id retitled `Agent · folder · excerpt`;
+while candidates remain, a fresh **＋ Pick up session** row with a new id
+appears on a later poll, and after the last one none does. Like the manage row
+it rejects prompts with `409` and is never a `default()` target; the **No
+sessions to pick up** notification covers a row whose candidates disappear
+beneath it.
+
 **A question's option count is bounded, and the bound is unknown.** Eleven options
 were silently not drawn on a physical phone — same failure signature as the
 same-tick question in ADR 0005: no error, no frame rejected, just a row awaiting an
-answer to a menu that is not there. The delete menu therefore pages at
-`MANAGE_SESSION_LIMIT` (default 4) and has no unlimited setting, unlike
-`WIZARD_DIRECTORY_LIMIT`, whose `0` predates this measurement and is now suspect
-for a workspace with many directories.
+answer to a menu that is not there. The delete and pickup menus therefore page at
+`MANAGE_SESSION_LIMIT` / `PICKUP_SESSION_LIMIT` (default 4) and have no unlimited
+setting, unlike `WIZARD_DIRECTORY_LIMIT`, whose `0` predates this measurement and
+is now suspect for a workspace with many directories.
 
-Opening either synthetic row's `/events` stream emits a `user_prompt` prime, then
+Opening any synthetic row's `/events` stream emits a `user_prompt` prime, then
 the outstanding question after `SETUP_QUESTION_DELAY_MS` (default 500). **A
 `user_question` emitted in the same tick as the stream opening is silently
 dropped by the app** — see ADR 0005 for the measurement. Every stream open
