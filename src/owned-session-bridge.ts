@@ -166,29 +166,39 @@ export class OwnedSessionBridge implements OwnedAgentSink {
       throw new SessionControlError(`${providerName(this.agentProvider)} is already processing a prompt.`, 409);
     }
     // Ahead of command resolution, and only for a provider that can actually switch:
-    // everywhere else this text is an ordinary prompt and must stay one.
+    // everywhere else this text is an ordinary prompt and must stay one. Both this
+    // and planCommand() are resolved before the turn opens, so a throw in either
+    // cannot strand a turn that nothing will terminalize.
     const wanted = this.agent.setMode ? parseModeInput(text) : null;
-    const plan = wanted ? null : this.planCommand(text);
-    this.beginTurn();
-    emit(this.id, { type: "user_prompt", text });
-    emit(this.id, { type: "status", state: "busy", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
-    // The turn is open before this point, so every command path that stops to ask is
-    // inside a turn `finishTurn` will close — cancellation included.
     if (wanted) {
+      this.openTurn(text);
       if (wanted.kind === "menu") this.askMode();
       else await this.applyMode(wanted.mode);
       return;
     }
-    if (plan!.kind === "ask") {
-      this.askCommand(plan!.interaction);
+    const plan = this.planCommand(text);
+    this.openTurn(text);
+    // The turn is open before this point, so every path that stops to ask is inside a
+    // turn `finishTurn` will close — cancellation included.
+    if (plan.kind === "ask") {
+      this.askCommand(plan.interaction);
       return;
     }
     try {
-      await this.agent.prompt(plan!.kind === "dispatch" ? plan!.text : text);
+      await this.agent.prompt(plan.kind === "dispatch" ? plan.text : text);
     } catch (error) {
       await this.finishFailure(error instanceof Error ? error.message : String(error));
       throw error;
     }
+  }
+
+  /** Open the turn every prompt path runs inside. The `user_prompt` + busy `status`
+   *  pair is also the prime a bridge-local menu needs to render (ADR 0005): the
+   *  stream has to look like a turn before a question lands on it. */
+  private openTurn(text: string): void {
+    this.beginTurn();
+    emit(this.id, { type: "user_prompt", text });
+    emit(this.id, { type: "status", state: "busy", sessionId: this.id, provider: "codex", agentProvider: this.agentProvider });
   }
 
   /** Decide what a prompt means against the provider's live command list. Ordinary
