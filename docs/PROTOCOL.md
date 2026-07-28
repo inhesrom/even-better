@@ -186,12 +186,16 @@ A third synthetic row, **＋ Pick up session**, appears once a recent terminal
 Its questions are `owned-pickup:<id>:pick` (candidates newest-first, labelled
 `<n> · Agent · folder` with an `Active <age>` description, plus **More
 sessions…** / **Cancel**) and `owned-pickup:<id>:confirm` (**Pick up here** /
-**Keep in terminal**). Adopting emits a **Session picked up** notification and
-the adopted session appears as an ordinary remembered row on the next
-`/api/sessions` poll; the provider resumes when that row is first opened, not at
-adopt time. Like the manage row it rejects prompts with `409`, is never a
-`default()` target, and stays in place with a **No sessions to pick up**
-notification once nothing is left.
+**Keep in terminal**). Confirming adopts **in place**: the row's own id becomes
+the remembered session (the wizard's promote-in-place), the open stream receives
+`status: idle` plus a **Session picked up** notification telling the user to
+speak, and the provider begins resuming in the background immediately. The next
+`/api/sessions` poll shows the same id retitled `Agent · folder · excerpt`;
+while candidates remain, a fresh **＋ Pick up session** row with a new id
+appears on a later poll, and after the last one none does. Like the manage row
+it rejects prompts with `409` and is never a `default()` target; the **No
+sessions to pick up** notification covers a row whose candidates disappear
+beneath it.
 
 **A question's option count is bounded, and the bound is unknown.** Eleven options
 were silently not drawn on a physical phone — same failure signature as the

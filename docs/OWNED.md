@@ -225,12 +225,15 @@ The row asks which session to pick up — newest first, labelled
 title excerpt — paged at `PICKUP_SESSION_LIMIT` (default 4) with **More
 sessions…**, then confirms with **Pick up here** / **Keep in terminal**.
 
-Picking up remembers the session; it does not start a process. The first open or
-prompt resumes the native session exactly like [Persistence and
-resume](#persistence-and-resume) — same lazy attach, same failure notification —
-and the adopted row is an ordinary remembered session from then on: the manage
-row deletes it (which frees the native session for adoption again), and its
-provider and directory are fixed.
+Picking up lands you in the session: the pickup row itself becomes the
+remembered row — same id, stream intact, exactly like the wizard promoting into
+the session it set up — a notification tells you to speak, and the provider
+resumes in the background so it is ready by the time you finish talking. A
+failed resume shows the same could-not-resume notification as any remembered
+row. From then on it is an ordinary remembered session: the manage row deletes
+it (which frees the native session for adoption again), and its provider and
+directory are fixed. While more terminal sessions remain adoptable, a fresh
+＋ Pick up session row appears in the list.
 
 **Close the terminal copy first.** Nothing stops the terminal process from
 continuing to write the same native session — the confirm step's warning is the
@@ -241,8 +244,8 @@ continue there.
 
 To verify against a real session: start `claude` in a directory under
 `WORKSPACE_ROOTS`, exchange a turn, then run `pnpm sim` — the pickup row appears
-in the picker; adopt, prompt from the sim, and afterwards `claude --resume` in
-the terminal shows the glasses turn.
+in the picker; adopt and speak straight away (the sim lands in the session), and
+afterwards `claude --resume` in the terminal shows the glasses turn.
 
 ## Verification
 

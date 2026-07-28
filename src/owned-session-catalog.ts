@@ -413,6 +413,15 @@ class OwnedCatalogSession implements LiveSession {
     this.save(true);
   }
 
+  /** Fire-and-forget resume for a just-adopted session: the provider child
+   *  spawns while the user starts talking, so the first prompt lands on a live
+   *  bridge (wizard parity). Runs the ordinary ensureAttached path — a prompt
+   *  spoken meanwhile coalesces onto the in-flight attach, and failure surfaces
+   *  through its could-not-resume notification. */
+  warmUp(): void {
+    void this.ensureAttached(false).catch(() => undefined);
+  }
+
   private async ensureAttached(forPrompt: boolean): Promise<OwnedSessionBridge> {
     if (this.bridge) {
       this.touch();
@@ -803,11 +812,16 @@ export class OwnedSessionCatalog implements SessionCatalog {
   }
 
   /** Takeover-by-resume: synthesize a remembered record whose nativeSessionId is
-   *  the external session's id, then let the ordinary lazy-attach path resume it
-   *  (Claude `resume:`, Codex `thread/resume`) when the row is opened. No
-   *  process is spawned here, so `maxSessions` is not consulted — the cap gates
-   *  attachNow(), on first open. */
-  async adopt(candidate: ExternalSessionCandidate): Promise<{ id: string; title: string }> {
+   *  the external session's id and resume it through the ordinary attach path
+   *  (Claude `resume:`, Codex `thread/resume`). With `takeOver` — the pickup row
+   *  itself — the record takes that row's public id, the same promote-in-place
+   *  `launch()` performs for the wizard: the phone's open stream carries straight
+   *  into the adopted session, and a fire-and-forget warm-up starts the resume
+   *  while the user speaks. The confirm POST never waits on the spawn. */
+  async adopt(
+    candidate: ExternalSessionCandidate,
+    takeOver?: OwnedPickupSession,
+  ): Promise<{ id: string; title: string }> {
     if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
     if (!this.config.providers[candidate.agentProvider]) {
       throw new SessionControlError(
@@ -835,10 +849,17 @@ export class OwnedSessionCatalog implements SessionCatalog {
     if (!inspection) {
       throw new SessionControlError("That session's transcript is gone; it may have been deleted.", 409);
     }
+    // Re-checked after the await: a dispose() landing during inspect must not
+    // save a record and mint a live session after shutdown — the same
+    // promote-after-dispose hazard attachNow re-checks.
+    if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
+    // From store.save through the handoff below nothing awaits, so no request
+    // can observe a half-swapped catalog.
+    const handingOff = takeOver !== undefined && this.pickup === takeOver;
     const now = new Date().toISOString();
     const record: RememberedSessionMetadata = {
       version: 1,
-      id: `owned:${randomUUID()}`,
+      id: handingOff ? takeOver.id : `owned:${randomUUID()}`,
       agentProvider: candidate.agentProvider,
       cwd,
       nativeSessionId: candidate.nativeSessionId,
@@ -863,10 +884,33 @@ export class OwnedSessionCatalog implements SessionCatalog {
     try {
       session.installLease(this.store.acquireLease(record.id));
     } catch {
-      // The id is freshly minted so EEXIST is impossible; a filesystem failure
+      // The id was minted this boot (by ensurePickup or just above) and the
+      // pickup row never leases, so EEXIST is impossible; a filesystem failure
       // surfaces when the row is opened, same as the restore loop.
     }
     this.config.workspaces.touch(cwd, Date.parse(now));
+    if (handingOff) {
+      // The map entry is already in place, so get(record.id) resolves to the
+      // adopted session the moment the pickup reference drops. handOff() only
+      // clears the row's question timer — dispose() would dropSession() and end
+      // the stream the phone is watching. Emissions happen here, not in the
+      // pickup row, mirroring where launch() emits its promote frames.
+      this.pickup = null;
+      takeOver.handOff();
+      emit(record.id, {
+        type: "status",
+        state: "idle",
+        sessionId: record.id,
+        provider: "codex",
+        agentProvider: record.agentProvider,
+      });
+      emit(record.id, {
+        type: "notification",
+        title: "Session picked up",
+        message: `Say your prompt to continue where the terminal left off. ${providerLabel(record.agentProvider)} is resuming in ${path.basename(cwd || "/")}.`,
+      });
+      session.warmUp();
+    }
     return { id: record.id, title: session.rowTitle };
   }
 

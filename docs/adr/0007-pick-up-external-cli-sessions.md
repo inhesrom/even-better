@@ -1,7 +1,9 @@
 # ADR 0007: Picking up coding-agent sessions started in a terminal
 
 - Status: Accepted
-- Date: 2026-07-27
+- Date: 2026-07-27 (amended 2026-07-28: adopt promotes in place — first sim use
+  showed that landing back in the picker after a successful adopt reads as
+  failure)
 - Builds on: ADR 0005, ADR 0006
 
 ## Context
@@ -27,12 +29,15 @@ an exact id — and a surface on the glasses to choose one.
 **Takeover-by-resume through a third synthetic row, ＋ Pick up session.**
 
 Adopting synthesizes an ordinary `RememberedSessionMetadata` whose
-`nativeSessionId` is the external session's id, saves it, and leases the row. No
-process starts at adopt time; the first open or prompt walks the existing
-lazy-attach path and resumes the native session, and a failed resume reuses the
-existing "could not resume" notification. Claude resumes the same session id in
-place (no `forkSession`), so the user can hand back later with
-`claude --resume <id>`.
+`nativeSessionId` is the external session's id — under the **pickup row's own
+public id**, the same promote-in-place the wizard's `launch()` performs. The
+phone's open stream carries straight into the adopted session (`status: idle`
+plus a speak-to-continue notification, never a dropped stream — the row is
+released by `handOff()`, not `dispose()`), and a fire-and-forget warm-up begins
+the resume through the ordinary attach path while the user starts talking. The
+confirm POST never waits on the spawn, and a failed resume reuses the existing
+"could not resume" notification. Claude resumes the same session id in place
+(no `forkSession`), so the user can hand back later with `claude --resume <id>`.
 
 Discovery (`owned-discovery.ts`) is read-only and spawns nothing:
 
@@ -55,9 +60,11 @@ itself created. A provider whose binary is missing contributes no candidates:
 adopting a session that can never attach is a trap.
 
 The row appears once at least one adoptable candidate exists, via a
-fire-and-forget probe so `list()` never waits on a filesystem scan, and is never
-torn down afterward (ADR 0006's hazard: dropping a row ends the phone's live
-stream). Its questions are `owned-pickup:<id>:pick` — candidates newest-first
+fire-and-forget probe so `list()` never waits on a filesystem scan. A successful
+adopt **consumes** it by handoff — the id lives on as the session, the stream is
+never ended — and a fresh row with a new id appears while candidates remain
+(wizard-slot semantics); it is never torn down while it exists (ADR 0006's
+hazard: dropping a row ends the phone's live stream). Its questions are `owned-pickup:<id>:pick` — candidates newest-first
 (the manage row is oldest-first because its question is "which is stale"; this
 one's is "which did I just leave"), labelled `<n> · Agent · folder` with an
 `Active <age>` freshness line, paged at `PICKUP_SESSION_LIMIT` (default 4) —
@@ -97,12 +104,14 @@ Rejected alternatives:
   confirm warning is the mitigation, and same-id resume is also what makes
   hand-back work. Sessions driven by a multiplexer or another tool look like
   ordinary CLI candidates and carry the same caveat.
-- An adopted session is an ordinary remembered row: the manage row deletes it
-  (releasing the native session for adoption again), the attach cap and LRU
-  eviction gate its process, and provider/cwd stay immutable after adoption.
-- Discovery failures quiet the row rather than surfacing through `list()`; a
-  candidate list that empties after the row exists leaves it in place with a
-  **No sessions to pick up** notification naming `WORKSPACE_ROOTS`.
+- An adopted session is an ordinary remembered row under the pickup row's id:
+  the manage row deletes it (releasing the native session for adoption again),
+  the attach cap and LRU eviction gate its process — the warm-up occupies the
+  slot an open would have — and provider/cwd stay immutable after adoption.
+- Discovery failures quiet the row rather than surfacing through `list()`. The
+  **No sessions to pick up** notification (naming `WORKSPACE_ROOTS`) now covers
+  only a live row whose candidates vanish beneath it; a successful adopt hands
+  the row off instead of re-asking.
 - `session_meta` line 0 of codex rollouts is now consumed (`session_id`, `cwd`)
   — a new forward-compat surface tracked in `docs/SESSIONS.md`. Its `originator`
   and `source` fields are deliberately unused: the remembered-id dedupe already

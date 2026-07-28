@@ -850,7 +850,7 @@ async function openPickup(catalog: OwnedSessionCatalog): Promise<LiveSession> {
   return session;
 }
 
-test("adopting an external session persists a record without spawning, then resumes it on first prompt", async () => {
+test("adopting promotes the pickup row in place and warms up the resume", async () => {
   const home = path.join(scratch, "state-pickup-adopt");
   const agents: FakeAgent[] = [];
   const source = new FakeSource([externalClaude("external-claude-1", project)]);
@@ -864,35 +864,51 @@ test("adopting an external session persists a record without spawning, then resu
     await pickup.respondQuestion("Pick up here");
     await settle(() => notified(pickup, "Session picked up"));
 
-    // The record exists, carries the external id, and no agent process started.
+    // Promote-in-place: the record lives under the row's own public id, and the
+    // open stream got the same idle frame launch() emits for the wizard.
     const records = store.list();
     assert.equal(records.length, 1);
+    assert.equal(records[0]?.id, pickup.id);
     assert.equal(records[0]?.nativeSessionId, "external-claude-1");
     assert.equal(records[0]?.agentProvider, "claude");
     assert.equal(records[0]?.cwd, project);
-    assert.equal(records[0]?.model, "fake-model");
     assert.equal(records[0]?.firstPrompt, "refactor the parser");
-    assert.equal(agents.length, 0);
+    assert.ok(getMessages(pickup.id, 0).some((message) =>
+      (message as { type?: string; state?: string }).type === "status"
+      && (message as { state?: string }).state === "idle",
+    ));
 
-    // Fixed synthetic-row order: wizard, manage, pickup, then remembered rows.
-    const rows = await catalog.list();
-    assert.deepEqual(
-      rows.map((row) => row.title),
-      ["＋ Agent setup", MANAGE_TITLE, PICKUP_TITLE, "Claude · project · refactor the parser"],
-    );
+    // The warm-up resumes the external session before any prompt, and its
+    // attach late-binds the model over the inspect-time value.
+    await settle(() => agents.length === 1);
+    assert.deepEqual(agents[0]?.resumes, ["external-claude-1"]);
+    await settle(() => store.list().find((record) => record.id === pickup.id)?.model === "fake-claude");
 
-    // The candidate is deduped away, so the re-asked menu is the empty state.
-    await settle(() => notified(pickup, "No sessions to pick up"));
-
-    // First prompt attaches through the ordinary path and resumes the external id.
-    const adopted = await catalog.get(records[0]!.id);
+    // get() routes past the handed-off row; prompting rides the warmed bridge
+    // instead of spawning a second child.
+    const adopted = await catalog.get(pickup.id);
     assert.ok(adopted);
+    assert.notEqual(adopted, pickup);
+    assert.equal(adopted.agentProvider, "claude");
     await adopted.prompt("hello");
     assert.equal(agents.length, 1);
-    assert.deepEqual(agents[0]?.resumes, ["external-claude-1"]);
+    assert.ok(agents[0]?.prompts.includes("hello"));
+
+    // The sole candidate was adopted, so no fresh pickup row appears and the
+    // picker was never re-asked on the adopted stream.
+    for (let poll = 0; poll < 3; poll++) {
+      assert.equal((await catalog.list()).find((row) => row.title === PICKUP_TITLE), undefined);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(
+      (await catalog.list()).map((row) => row.title),
+      ["＋ Agent setup", MANAGE_TITLE, "Claude · project · refactor the parser"],
+    );
+    assert.equal(asked(pickup, "pick"), 1);
 
     // Forgetting the adopted row releases the native session for adoption again.
-    await catalog.forget(records[0]!.id);
+    await catalog.forget(pickup.id);
+    assert.equal(agents[0]?.disposed, 1);
     assert.deepEqual(store.list(), []);
     assert.equal((await catalog.adoptable(true)).length, 1);
   } finally {
@@ -945,6 +961,12 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+
+    // A live row whose candidates vanished beneath it lands on the empty state
+    // (success no longer reaches it — the row hands itself off instead).
+    source.available = [];
+    await pickup.respondQuestion("Cancel");
+    await settle(() => notified(pickup, "No sessions to pick up"));
   } finally {
     await catalog.dispose();
   }
@@ -987,9 +1009,68 @@ test("answers are rejected while an adopt is in flight, and the pick menu pages"
     await inflight;
     await settle(() => notified(pickup, "Session picked up"));
     assert.equal(store.list().length, 1);
+    assert.equal(store.list()[0]?.id, pickup.id);
+
+    // Candidates remain, so a fresh pickup row with a new id appears; the old
+    // id routes to the adopted session, and a stale answer to it cannot adopt.
+    const fresh = await waitForPickupRow(catalog);
+    assert.notEqual(fresh.id, pickup.id);
+    const promoted = await catalog.get(pickup.id);
+    assert.ok(promoted?.agentProvider);
+    await assert.rejects(promoted!.respondQuestion("anything"));
   } finally {
     await catalog.dispose();
   }
+});
+
+test("a failed warm-up surfaces could-not-resume and a later prompt retries", async () => {
+  const home = path.join(scratch, "state-pickup-warmfail");
+  const agents: FakeAgent[] = [];
+  const source = new FakeSource([externalClaude("external-claude-5", project)]);
+  const store = new OwnedSessionStore(home);
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents, true), store, source);
+  try {
+    const pickup = await openPickup(catalog);
+    await pickup.respondQuestion("1 · Claude · project");
+    await pickup.respondQuestion("Pick up here");
+    await settle(() => notified(pickup, "Claude session could not resume"));
+    // The handoff already happened — the record and row survive the failed
+    // resume, and the next prompt retries the attach.
+    assert.equal(store.list()[0]?.id, pickup.id);
+    const adopted = await catalog.get(pickup.id);
+    assert.ok(adopted);
+    await assert.rejects(adopted.prompt("hello"), /resume failed/);
+    assert.equal(agents.length, 2);
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+test("a reconnect after handoff lands on the adopted session, and dispose tears it down", async () => {
+  const home = path.join(scratch, "state-pickup-reconnect");
+  const agents: FakeAgent[] = [];
+  const source = new FakeSource([externalClaude("external-claude-6", project)]);
+  const store = new OwnedSessionStore(home);
+  const catalog = new OwnedSessionCatalog(config(home), factory(agents), store, source);
+  const pickup = await openPickup(catalog);
+  await pickup.respondQuestion("1 · Claude · project");
+  await pickup.respondQuestion("Pick up here");
+  await settle(() => agents.length === 1);
+  const picksBefore = asked(pickup, "pick");
+
+  const adopted = await catalog.get(pickup.id);
+  assert.ok(adopted);
+  await adopted.onConnect?.();
+  adopted.replayPending?.();
+  // No picker, no "Picking up…", no second child — an ordinary remembered open.
+  assert.equal(asked(pickup, "pick"), picksBefore);
+  assert.equal(notified(pickup, "Picking up…"), false);
+  assert.equal(agents.length, 1);
+
+  await catalog.dispose();
+  assert.equal(agents[0]?.disposed, 1);
+  const leasePath = path.join(home, "sessions", pickup.id.slice("owned:".length), "lease.json");
+  assert.equal(fs.existsSync(leasePath), false);
 });
 
 test("adoptable() offers nothing when the provider binary is missing, and adopt() refuses", async () => {

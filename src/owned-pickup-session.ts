@@ -163,6 +163,17 @@ export class OwnedPickupSession implements LiveSession {
     dropSession(this.id);
   }
 
+  /** The success half of dispose(): the public id lives on as the adopted
+   *  session, so the SSE stream must NOT be dropped — dispose()'s dropSession()
+   *  would res.end() the stream the phone is watching. Only the row object
+   *  dies: clear the deferred-question timer and the pending wire so nothing
+   *  can put a pick menu on the adopted session's stream. */
+  handOff(): void {
+    clearTimeout(this.questionTimer ?? undefined);
+    this.questionTimer = null;
+    this.pendingWire = null;
+  }
+
   private async answerPick(value: string): Promise<void> {
     if (!value || value.toLowerCase() === CANCEL.toLowerCase()) {
       this.ack(CANCEL);
@@ -209,29 +220,26 @@ export class OwnedPickupSession implements LiveSession {
     await this.beginAdopt(target);
   }
 
-  /** Fire-and-forget for the same reason `beginLaunch` and `beginForget` are:
-   *  adopt() re-reads the native transcript, and awaiting it here would hold the
-   *  phone's question-response POST open for the whole time. Every outcome is
-   *  reported over SSE instead. */
+  /** The confirm POST resolves when the adopt settles (bounded transcript
+   *  reads, no spawn — the warm-up is fire-and-forget inside the catalog), so
+   *  success and failure both report before the phone re-polls. */
   private beginAdopt(target: Candidate): Promise<void> {
     this.adopting = true;
     this.target = null;
     return this.catalog
-      .adopt(target.candidate)
-      .then(({ title }) => {
-        this.notify(
-          "Session picked up",
-          `${title} is in your session list now. Open it and speak to continue where the terminal left off.`,
-        );
+      .adopt(target.candidate, this)
+      .then(() => {
+        // Handed off: this public id is the remembered session now and get()
+        // routes past this object. The catalog emitted the promote frames and
+        // began the warm-up; nothing here may touch the wire again. `adopting`
+        // stays true so the state getter and the deferred-question live()
+        // guard keep any stray reference inert.
       })
       .catch((error: unknown) => {
         this.notify("Could not pick up session", error instanceof Error ? error.message : String(error));
-      })
-      .finally(() => {
         this.adopting = false;
-        // The list shifted under the page, and a fresh adoptable() now excludes
-        // the adopted session — the re-ask reflects the shrunk list, and the
-        // last adopt lands on the "No sessions to pick up" state.
+        // The list may have shifted; re-ask from the top. A candidate list
+        // that emptied lands on the "No sessions to pick up" state.
         this.pageStart = 0;
         void this.askPick(true);
       });

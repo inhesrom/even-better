@@ -64,9 +64,11 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   (**＋ Pick up session**: pick → confirm → `catalog.adopt`) for taking over
   `claude`/`codex` sessions the user started in a terminal, and the read-only
   discovery behind it (SDK `listSessions` for Claude, windowed rollout
-  `session_meta` scan for Codex). Adopt synthesizes a remembered record around
-  the external `nativeSessionId`; the ordinary lazy attach resumes it on first
-  open. See ADR 0007.
+  `session_meta` scan for Codex). Adopt promotes the row **in place** — the
+  remembered record takes the row's public id, wizard-style, so the open stream
+  lands in the session (`handOff()`, never `dispose()`, which would end it) —
+  and a fire-and-forget warm-up resumes the provider; a fresh row with a new id
+  is minted while candidates remain. See ADR 0007.
 - **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
   and common owned bridge. Provider adapters own only their native protocol;
   the common bridge owns public IDs, pacing, interactions, and wire events.
@@ -230,9 +232,11 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   session list down. Candidates dedupe against every remembered
   `nativeSessionId` (which also excludes even-better's own children — owned
   agents share the user's real `~/.claude`/`~/.codex`), the transcript cwd passes
-  the same workspace validation as a phone answer, and adopt never attaches —
-  resume happens on first open, where the existing failure notification already
-  lives. Nothing guards the terminal copy still writing the same native session;
+  the same workspace validation as a phone answer, and adopt never attaches
+  inline — the post-handoff warm-up is fire-and-forget through the ordinary
+  attach path, so failure surfaces through the existing could-not-resume
+  notification and never through the confirm POST. Nothing guards the terminal
+  copy still writing the same native session;
   the confirm step's warning is deliberate (ADR 0007), not a gap to fix with
   process scanning.
 - **Only ＋ (U+FF0B) and `·` are known to render in a row title.** 🗑 did not.

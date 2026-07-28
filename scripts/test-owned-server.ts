@@ -29,6 +29,7 @@ interface WireMessage {
   agentProvider?: string;
   toolUseId?: string;
   title?: string;
+  state?: string;
 }
 
 /** Exactly one wizard row is always offered so agent and directory can be chosen
@@ -679,21 +680,31 @@ test("the pickup row adopts a terminal codex session, and the adopted row resume
         "the adoption notification",
         () => stream.events.some((event) => event.title === "Session picked up"),
       );
+      // Promote-in-place: the open stream gets the same idle frame the wizard's
+      // promote emits, and the handoff must never end the phone's stream.
+      await waitFor(
+        "the promote status frame",
+        () => stream.events.some((event) =>
+          event.type === "status" && event.state === "idle" && event.agentProvider === "codex"),
+      );
+      assert.equal(stream.ended, false, "the handoff must not end the phone's stream");
     } finally {
       stream.close();
     }
 
-    // The adopted row is an ordinary remembered session: codex identity, the
-    // transcript's cwd, and the transcript's first user message as its excerpt.
+    // The pickup row itself became the remembered session: same public id,
+    // codex identity, the transcript's cwd and first user message as excerpt.
     const listed = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
     const adopted = agentRows(listed.sessions).find((session) => session.agentProvider === "codex");
     assert.ok(adopted, `expected an adopted codex row, got ${JSON.stringify(listed.sessions.map((s) => s.title))}`);
+    assert.equal(adopted.id, row.id);
     assert.equal(adopted.cwd, workspace);
     assert.equal(adopted.status, "idle");
     assert.equal(adopted.title, `Codex · ${folder} · refactor the reader`);
 
-    // First prompt spawns the fixture and resumes the external thread id; the
-    // fixture then runs its ordinary approval → question → result turn.
+    // The warm-up already spawned the fixture and resumed the external thread
+    // id; the prompt rides that bridge and runs the ordinary approval →
+    // question → result turn.
     await api(base, "/prompt", {
       method: "POST",
       body: JSON.stringify({ sessionId: adopted.id, text: "continue where I left off" }),
