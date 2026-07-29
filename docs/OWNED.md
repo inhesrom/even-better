@@ -218,8 +218,8 @@ bounded deadlines, and releases catalog leases without forgetting sessions.
 
 From the glasses, the **＋ Manage sessions** row appears in the list once at least
 one session is remembered, directly after the wizard row. It asks which session
-to delete — oldest first, labelled `<n> · Agent · folder` with its age and
-first-prompt excerpt — then confirms with **Delete forever** / **Keep**.
+to delete — oldest first, labelled `<n> · Agent · folder · excerpt` (its first
+prompt) with its age — then confirms with **Delete forever** / **Keep**.
 
 The menu shows `MANAGE_SESSION_LIMIT` sessions at a time (default 4) and offers
 **More sessions…** when others remain; ordinals continue across pages, so a
@@ -227,6 +227,13 @@ recent session is still reachable. This has no unlimited setting: an eleven-opti
 menu did not render at all on a physical phone — the row simply sat awaiting an
 answer to a menu that was never drawn. After a delete the list has shifted, so
 paging restarts at the oldest.
+
+**Cancel** backs out of the row rather than re-showing the picker: the turn
+closes and the row's stream ends, which is the only way the server can put the
+glasses back on the session list — there is no navigation event in the protocol.
+The row itself is retired and a fresh one, with a new id, is offered on the next
+poll; opening it starts over at the picker. (If the app stays on the dead row,
+double-tap back — the replacement is already in the list.)
 
 The row only removes sessions: prompting it returns `409`, and ＋ New
 Session still lands on the wizard. A busy session is interrupted and its agent
@@ -265,7 +272,7 @@ The row asks which session to pick up — newest first, labelled
 `<n> · Agent · folder · excerpt` (the session's title or first prompt) with an
 `Active <age> · branch` freshness line — paged at `PICKUP_SESSION_LIMIT`
 (default 4) with **More sessions…**, then confirms with **Pick up here** /
-**Keep in terminal**.
+**Keep in terminal**. Its **Cancel** retires the row like the manage row's.
 
 Picking up lands you in the session: the pickup row itself becomes the
 remembered row — same id, stream intact, exactly like the wizard promoting into

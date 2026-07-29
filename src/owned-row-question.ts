@@ -8,10 +8,11 @@
 // answerable on a physical phone; the same payload sent synchronously is
 // dropped, with no error on either side.
 //
-// Both halves live here because both synthetic rows (the setup wizard and the
-// manage row) depend on them and neither can afford to drift. The failure mode
-// is a blank row, not an exception — `assertPrimedQuestion` in
-// `scripts/test-owned-server.ts` is the only thing that notices.
+// Both halves live here — with the terminal one that ends such a turn — because
+// the synthetic rows (the setup wizard, the manage row, the pickup row) depend
+// on them and none can afford to drift. The failure mode is a blank row, not an
+// exception — `assertPrimedQuestion` in `scripts/test-owned-server.ts` is the
+// only thing that notices.
 //
 // Only the first question after a stream opens needs this. Answers emit their
 // follow-up question synchronously and the app renders those fine.
@@ -39,4 +40,26 @@ export function deferRowQuestion(
   // A question nobody answers must not be why the process cannot exit.
   timer.unref();
   return timer;
+}
+
+/** Close the turn `primeRow` opened, the way `finishTurn` closes an agent's:
+ *  a `result` the transcript keeps, then `status: idle` so the thinking
+ *  indicator clears. A row that runs no agent reports the zeros and no
+ *  `agentProvider`. The caller has already acked the answer and cleared its
+ *  `pendingWire`; the next stream open re-primes and rebuilds the menu, which is
+ *  what makes going quiet safe rather than indistinguishable from broken. */
+export function closeRowTurn(id: string, text: string): void {
+  emit(id, {
+    type: "result",
+    success: true,
+    text,
+    sessionId: id,
+    costUsd: 0,
+    provider: "codex",
+    turns: 0,
+    durationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+  });
+  emit(id, { type: "status", state: "idle", sessionId: id, provider: "codex" });
 }

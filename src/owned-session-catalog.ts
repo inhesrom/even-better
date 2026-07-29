@@ -758,6 +758,29 @@ export class OwnedSessionCatalog implements SessionCatalog {
     return Promise.resolve(this.sessions.get(id));
   }
 
+  /** Cancel's way out of a synthetic row. The protocol has no navigation event —
+   *  the app owns the visual — so ending the row's SSE stream is the only lever we
+   *  have to put the user back on the session list, and a row whose stream we just
+   *  ended must not be the one they re-enter. Dropping it here means the next
+   *  `list()` mints a replacement with a **new id**, which is also what forces the
+   *  app to open a fresh stream (and with it the prime + menu) instead of holding
+   *  the dead one. Null first, then dispose: a `list()` racing the teardown must
+   *  not describe a row whose stream has already ended. */
+  retire(row: OwnedManageSession | OwnedPickupSession): void {
+    if (this.manager === row) {
+      // ensureManager() re-mints synchronously on the very next list().
+      this.manager = null;
+    } else if (this.pickup === row) {
+      // ensurePickup() cannot: its probe is fire-and-forget, so the row would be
+      // missing from exactly the list the app polls after Cancel — the user backs
+      // out and finds nothing to re-enter. A candidate existed a moment ago, and
+      // if they have since gone, opening the replacement lands on "No sessions to
+      // pick up", which the row already handles.
+      this.pickup = new OwnedPickupSession(`owned:${randomUUID()}`, this);
+    } else return;
+    row.dispose();
+  }
+
   /** Remembered rows only, oldest first — the manage menu asks "which of these is
    *  stale", so the answer belongs at the top. Both synthetic rows are excluded by
    *  `agentProvider`, which only a promoted session has. */
@@ -966,10 +989,10 @@ export class OwnedSessionCatalog implements SessionCatalog {
   }
 
   /** The manage row appears once there is anything to manage, so a fresh install
-   *  shows only the launcher. It is never torn down again: dropping it would
-   *  `res.end()` the phone's stream with no notification — the same hazard
-   *  `createSetup()` documents — so a manager with nothing left to delete says so
-   *  instead of vanishing mid-use. */
+   *  shows only the launcher, and it is re-minted here after `retire()` takes the
+   *  cancelled one away. A manager with nothing left to delete still says so
+   *  rather than vanishing under the user: that `res.end()` is only ever an exit
+   *  the user asked for, never a surprise mid-use. */
   private ensureManager(): void {
     if (this.disposed || this.manager) return;
     if (!this.deletable(1).length) return;
@@ -978,9 +1001,9 @@ export class OwnedSessionCatalog implements SessionCatalog {
 
   /** The pickup row appears once at least one adoptable external session exists.
    *  The probe is fire-and-forget so list() never waits on a filesystem scan —
-   *  the row simply appears on a later poll once discovery lands. Like the
-   *  manage row it is never torn down again (dropping a row `res.end()`s the
-   *  phone's stream); with nothing left to adopt it says so instead. */
+   *  the row simply appears on a later poll once discovery lands, which is also
+   *  how a cancelled one comes back after `retire()`. With nothing left to adopt
+   *  it says so instead of vanishing under the user. */
   private ensurePickup(): void {
     if (this.disposed || this.pickup || this.pickupProbe) return;
     this.pickupProbe = this.adoptable()

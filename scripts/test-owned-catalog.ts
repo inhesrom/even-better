@@ -159,6 +159,21 @@ const asked = (session: LiveSession, step: string): number =>
 const notified = (session: LiveSession, title: string): boolean =>
   getMessages(session.id, 0).some((message) => (message as { title?: string }).title === title);
 
+/** A picker that stops asking without this leaves the glasses thinking forever.
+ *  (Cancel's own `result` + idle pair is asserted in `test-owned-server.ts`:
+ *  retiring the row drops its ring buffer, so only a live stream sees them.) */
+const wentIdle = (session: LiveSession): boolean =>
+  getMessages(session.id, 0).some((message) =>
+    (message as { type?: string }).type === "status"
+    && (message as { state?: string }).state === "idle");
+
+/** A fresh stream open, as index.ts drives it. This is what re-arms a picker
+ *  that Cancel left quiet — the row rebuilds its menu, it never re-asks itself. */
+async function reconnect(session: LiveSession): Promise<void> {
+  await session.onConnect?.();
+  session.replayPending?.();
+}
+
 /** The list minus the wizard row, which the catalog now always offers so agent and
  *  directory can be chosen before any prompt exists. Setup rows carry no
  *  `agentProvider`; remembered ones always do. */
@@ -599,7 +614,9 @@ test("the manage row appears only once something is remembered, and sorts after 
     assert.equal(listed[0]?.title, "＋ Agent setup");
     assert.equal(listed[1]?.title, MANAGE_TITLE);
     assert.equal(listed[2]?.agentProvider, "claude");
-    assert.equal(manageRow(listed)?.status, "awaiting");
+    // Idle until it is opened: `awaiting` is derived from a menu that exists, and
+    // a utility row nobody has opened is not waiting on the user.
+    assert.equal(manageRow(listed)?.status, "idle");
   } finally {
     await catalog.dispose();
   }
@@ -617,6 +634,9 @@ test("the manage row deletes a remembered session and re-arms its menu", async (
     assert.ok(fs.existsSync(directory));
 
     const manager = await openManager(catalog);
+    // The label carries the prompt excerpt, like the pickup row's: agent and
+    // folder alone do not say which session is about to be deleted.
+    assert.equal(pickLabel(manager, doomed.id, catalog), "1 · Claude · project · delete me");
     await manager.respondQuestion(pickLabel(manager, doomed.id, catalog));
     assert.equal(asked(manager, "confirm"), 1);
 
@@ -664,9 +684,31 @@ test("the manage row keeps a session on Keep, on Cancel, and on an unrecognized 
     assert.equal(asked(manager, "confirm"), 3);
 
     await manager.respondQuestion("Keep");
+    assert.equal(asked(manager, "pick"), 3);
+
+    // Cancel leaves the row: it closes the turn the prime opened, ends the row's
+    // stream and retires the row, instead of putting the same picker back — which
+    // was a menu with no way out of it.
     await manager.respondQuestion("Cancel");
     assert.equal(store.list().length, 1);
-    assert.ok(notified(manager, "Nothing deleted"));
+    assert.equal(manager.state, "idle");
+    assert.equal(await catalog.get(manager.id), undefined, "the cancelled row is gone");
+    // dropSession() took the row's SSE buffer with it, which is the same call
+    // that ends the phone's stream. (That the picker is not re-asked first is
+    // asserted on a live stream in test-owned-server.ts.)
+    assert.equal(getMessages(manager.id, 0).length, 0, "the row's stream was dropped");
+    // The menu is gone, so a stray second tap cannot land in the unrecognized
+    // branch and re-arm it.
+    await assert.rejects(manager.respondQuestion("Cancel"), /No question is pending/);
+
+    // A replacement with a new id is what brings the picker back: the app has to
+    // open a fresh stream for it, and that is what primes and asks.
+    const replacement = await openManager(catalog);
+    assert.notEqual(replacement.id, manager.id);
+    assert.equal(replacement.state, "awaiting");
+    await replacement.respondQuestion("Cancel");
+    assert.equal(store.list().length, 1);
+    assert.equal(await catalog.get(replacement.id), undefined);
   } finally {
     await catalog.dispose();
   }
@@ -712,6 +754,11 @@ test("the last delete leaves the row in place, saying there is nothing left", as
     // row survives with an explanation instead of vanishing mid-use.
     assert.ok(manageRow(await catalog.list()));
     assert.equal(asked(manager, "pick"), 1, "an empty menu must not be re-emitted");
+    // …and it says so idle. A row with no menu left that still reads `awaiting`
+    // is a thinking indicator nothing will ever clear.
+    assert.ok(wentIdle(manager));
+    assert.equal(manager.state, "idle");
+    assert.equal(manageRow(await catalog.list())?.status, "idle");
   } finally {
     await catalog.dispose();
   }
@@ -741,8 +788,8 @@ test("the confirm question names the exact row when two sessions share a directo
   const home = path.join(scratch, "state-manage-ambiguous");
   const catalog = new OwnedSessionCatalog(config(home), factory([]));
   try {
-    // Same provider, same cwd: the short menu label is identical for both, so the
-    // confirm has to carry the prompt excerpt or it asks "delete which one?" about
+    // Same provider, same cwd: only the excerpt tells them apart, so the confirm
+    // has to carry the full row title or it asks "delete which one?" about
     // something irreversible.
     await setup(catalog, "claude", "first task");
     await setup(catalog, "claude", "second task");
@@ -815,9 +862,14 @@ class FakeSource implements ExternalSessionSource {
       () => Promise.resolve({ model: "fake-model", firstPrompt: "refactor the parser" }),
   ) {}
 
+  /** Deferred by a macrotask, not resolved inline: real discovery is filesystem
+   *  I/O and the SDK's session listing, so a promise that settles within the same
+   *  microtask turn hides every latency the fire-and-forget probe actually has —
+   *  including a replacement pickup row arriving one poll late. */
   candidates(providers: readonly PickupProvider[]): Promise<ExternalSessionCandidate[]> {
     this.candidateCalls++;
-    return Promise.resolve(this.available.filter((candidate) => providers.includes(candidate.agentProvider)));
+    const matching = this.available.filter((candidate) => providers.includes(candidate.agentProvider));
+    return new Promise((resolve) => setTimeout(() => resolve(matching), 0));
   }
 
   inspect(): Promise<ExternalSessionInspection | null> {
@@ -931,30 +983,50 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
     await settle(() => asked(pickup, "confirm") >= 2);
     await pickup.respondQuestion("Keep in terminal");
     await settle(() => asked(pickup, "pick") >= 2);
+
+    // Cancel leaves the row here too: the turn closes, the row is retired, and a
+    // replacement with a new id carries the picker.
     await pickup.respondQuestion("Cancel");
-    await settle(() => notified(pickup, "Nothing picked up"));
+    // dropSession() took the row's SSE buffer with it, which is the same call
+    // that ends the phone's stream. (That the picker is not re-asked first is
+    // asserted on a live stream in test-owned-server.ts.)
+    assert.equal(getMessages(pickup.id, 0).length, 0, "the row's stream was dropped");
+    assert.equal(pickup.state, "idle");
+    assert.equal(await catalog.get(pickup.id), undefined, "the cancelled row is gone");
+    await assert.rejects(pickup.respondQuestion("Cancel"), /No question is pending/);
     assert.deepEqual(store.list(), []);
+
+    // The replacement is on the very first poll after Cancel, not a later one:
+    // the app lists once as it backs out of the row, and a row left to the
+    // fire-and-forget discovery probe would not be on that list. (The polling
+    // `openPickup` helper hides exactly this.)
+    const replacement = (await catalog.list()).find((item) => item.title === PICKUP_TITLE);
+    assert.ok(replacement, "expected a replacement pickup row on the first poll");
+    assert.notEqual(replacement.id, pickup.id);
+    const second = await catalog.get(replacement.id);
+    assert.ok(second);
+    await reconnect(second);
+    await settle(() => asked(second, "pick") >= 1);
 
     // A candidate whose transcript vanished between pick and adopt.
     source.inspection = () => Promise.resolve(null);
-    await settle(() => asked(pickup, "pick") >= 3);
-    await pickup.respondQuestion("1 · Claude · project · refactor the parser");
-    await pickup.respondQuestion("Pick up here");
-    await settle(() => notified(pickup, "Could not pick up session"));
+    await second.respondQuestion("1 · Claude · project · refactor the parser");
+    await second.respondQuestion("Pick up here");
+    await settle(() => notified(second, "Could not pick up session"));
     assert.deepEqual(store.list(), []);
 
     // A cwd outside WORKSPACE_ROOTS is refused with the actionable message. The
-    // menu on screen predates the swap, so Cancel forces a rebuild that shows the
-    // outside candidate before it is picked.
+    // menu on screen predates the swap, so a fresh stream open rebuilds it and
+    // shows the outside candidate before it is picked.
     const outside = await mkdtemp(path.join(os.tmpdir(), "even-better-pickup-outside-"));
     try {
       source.available = [externalClaude("external-claude-3", outside)];
       source.inspection = () => Promise.resolve({ model: "fake-model" });
-      await pickup.respondQuestion("Cancel");
-      await settle(() => asked(pickup, "pick") >= 5);
-      await pickup.respondQuestion(`1 · Claude · ${path.basename(outside)} · refactor the parser`);
-      await pickup.respondQuestion("Pick up here");
-      await settle(() => getMessages(pickup.id, 0).some((message) =>
+      await reconnect(second);
+      await settle(() => asked(second, "pick") >= 3);
+      await second.respondQuestion(`1 · Claude · ${path.basename(outside)} · refactor the parser`);
+      await second.respondQuestion("Pick up here");
+      await settle(() => getMessages(second.id, 0).some((message) =>
         (message as { message?: string }).message?.includes("WORKSPACE_ROOTS") === true,
       ));
       assert.deepEqual(store.list(), []);
@@ -965,8 +1037,9 @@ test("cancel, keep, and unrecognized answers never adopt; failures notify withou
     // A live row whose candidates vanished beneath it lands on the empty state
     // (success no longer reaches it — the row hands itself off instead).
     source.available = [];
-    await pickup.respondQuestion("Cancel");
-    await settle(() => notified(pickup, "No sessions to pick up"));
+    await reconnect(second);
+    await settle(() => notified(second, "No sessions to pick up"));
+    assert.equal(second.state, "idle");
   } finally {
     await catalog.dispose();
   }
