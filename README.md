@@ -24,7 +24,7 @@ one standalone Grok ACP session.
 
 ## Prerequisites
 
-- **Node.js ≥ 18** and **pnpm**.
+- **Node.js ≥ 18** (pnpm too if installing from source).
 - For the mux source: **macOS** (primary target), with one terminal
   multiplexer running and at least one `claude` or `codex` agent live in a pane:
   - **[herdr](https://herdr.dev)**, or
@@ -42,13 +42,17 @@ one standalone Grok ACP session.
 ## Quick start
 
 ```bash
-corepack pnpm install
-corepack pnpm build
-npm install -g .
+curl -fsSL https://raw.githubusercontent.com/inhesrom/even-better/main/install.sh | bash
 
 cd /path/to/workspace
 even-better          # prints a QR code — scan it with the Even App
 ```
+
+The installer puts the latest [release](https://github.com/inhesrom/even-better/releases)
+under `~/.local/share/even-better` and links `~/.local/bin/even-better` — no sudo,
+no npm. `EVEN_BETTER_VERSION=v0.1.0` pins a release and `EVEN_BETTER_INSTALL_DIR`
+moves the install; the curl-averse can download the tarball from the Releases
+page, verify it against `SHA256SUMS`, and extract it anywhere.
 
 The launch directory is the default workspace root. Open the **＋ Agent setup**
 row and even-better asks which agent, then which directory — every eligible
@@ -59,7 +63,15 @@ retained through the wizard and sent once the provider is up. Completed sessions
 remain in the list after server restarts and resume their native provider context
 when reopened.
 
-From a source checkout, `corepack pnpm start` provides the same default.
+### From source (development)
+
+```bash
+corepack pnpm install
+corepack pnpm build
+npm install -g .
+```
+
+`corepack pnpm start` runs the same default straight from the checkout.
 
 To mirror existing herdr/cmux panes instead, run:
 
