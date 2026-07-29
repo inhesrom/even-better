@@ -10,7 +10,7 @@ import path from "node:path";
 import { parseAnswer } from "./owned-commands.js";
 import { compactPrompt, formatAge, providerLabel } from "./owned-format.js";
 import type { OwnedSessionCatalog } from "./owned-session-catalog.js";
-import { deferRowQuestion, primeRow } from "./owned-row-question.js";
+import { closeRowTurn, deferRowQuestion, primeRow } from "./owned-row-question.js";
 import {
   SessionControlError,
   type LiveSession,
@@ -33,16 +33,17 @@ type ManageStep = "pick" | "confirm";
 
 interface Candidate {
   id: string;
-  /** Exactly what the menu showed. Answers carry no correlation id, so the label
-   *  is the only key back to the session — and the ordinal prefix is what makes
-   *  it unique when two sessions share a provider and a directory. */
+  /** Exactly what the menu showed, excerpt included — the label is what
+   *  identifies a session at a glance, and two sessions in one directory are
+   *  otherwise indistinguishable. Answers carry no correlation id, so the label
+   *  is also the only key back to the session; the ordinal prefix keeps it
+   *  unique and speakable. */
   label: string;
   /** The catalog's own row title, for the confirm question — the string the user
-   *  recognizes from the list, prompt excerpt included. The short label alone
-   *  cannot tell two sessions in one directory apart. */
+   *  recognizes from the session list. */
   title: string;
-  /** Age plus a prompt excerpt: the label is deliberately short, so this is where
-   *  two same-provider, same-directory sessions are told apart. */
+  /** Age alone: which session is oldest is the question the delete menu asks,
+   *  and the excerpt that answers "which one is this" is in the label. */
   description: string;
 }
 
@@ -67,8 +68,11 @@ export class OwnedManageSession implements LiveSession {
 
   get state(): SessionState {
     // Never `awaiting` while a delete is running: there is no menu to answer, and
-    // respondQuestion() would reject the answer anyway.
-    return this.deleting ? "busy" : "awaiting";
+    // respondQuestion() would reject the answer anyway. Awaiting is derived from
+    // the pending menu rather than assumed: a cancelled or empty picker has none,
+    // and a row that reads needs-input forever is the bug this fixed.
+    if (this.deleting) return "busy";
+    return this.pendingWire ? "awaiting" : "idle";
   }
 
   describe(): Promise<SessionDescriptor> {
@@ -95,6 +99,10 @@ export class OwnedManageSession implements LiveSession {
 
   async respondQuestion(answer: string): Promise<void> {
     if (this.deleting) throw new SessionControlError("A session is being deleted.", 409);
+    // A cancelled row has no menu, and answering one that is gone would land in
+    // the unrecognized-answer branch and put the picker back — the loop Cancel
+    // exists to leave.
+    if (!this.pendingWire) throw new SessionControlError("No question is pending.", 409);
     const value = parseAnswer(answer).trim();
     switch (this.step) {
       case "pick":
@@ -143,11 +151,15 @@ export class OwnedManageSession implements LiveSession {
   replayPending(): void {
     if (this.deleting || !this.pendingWire) return;
     clearTimeout(this.questionTimer ?? undefined);
+    // Fenced on the wire that was pending when the timer was armed: an answer
+    // landing inside the delay replaces or clears it, and firing the captured
+    // one would put a stale menu on a row that has moved on.
+    const wire = this.pendingWire;
     this.questionTimer = deferRowQuestion(
       this.id,
-      this.pendingWire,
+      wire,
       this.catalog.config.setupQuestionDelayMs,
-      () => !this.deleting,
+      () => !this.deleting && this.pendingWire === wire,
     );
   }
 
@@ -160,11 +172,15 @@ export class OwnedManageSession implements LiveSession {
   private answerPick(value: string): void {
     if (!value || value.toLowerCase() === CANCEL.toLowerCase()) {
       this.ack(CANCEL);
-      this.notify("Nothing deleted", "Every session was kept.");
-      // Re-armed rather than left blank: this row has nowhere else to go, and a
-      // menu-less row is indistinguishable from a broken one.
+      // Cancel leaves the row, it does not re-arm it: re-emitting the picker was
+      // a menu with no way out, and going merely quiet left the user on a dead
+      // row. Close the turn, then hand the row to retire() — that ends the SSE
+      // stream (the only lever the protocol gives us to put the app back on the
+      // session list) and mints a replacement with a new id on the next poll.
+      this.pendingWire = null;
       this.pageStart = 0;
-      this.askPick(true);
+      closeRowTurn(this.id, "Cancelled — nothing deleted.");
+      this.catalog.retire(this);
       return;
     }
     if (value.toLowerCase() === MORE.toLowerCase()) {
@@ -236,20 +252,26 @@ export class OwnedManageSession implements LiveSession {
     // showing an empty menu.
     if (this.pageStart >= all.length) this.pageStart = 0;
     const page = all.slice(this.pageStart, this.pageStart + size);
-    this.displayed = page.map((session, index) => ({
-      id: session.id,
-      label: `${this.pageStart + index + 1} · ${providerLabel(session.agentProvider!)} · ${path.basename(session.cwd || "/")}`,
-      title: session.rowTitle,
-      description: `${formatAge(session.lastUsedMs, now)} · ${
-        session.firstPrompt ? compactPrompt(session.firstPrompt, 40) : "No prompts yet"
-      }`,
-    }));
+    this.displayed = page.map((session, index) => {
+      const folder = path.basename(session.cwd || "/");
+      const excerpt = session.firstPrompt ? compactPrompt(session.firstPrompt, 32) : "";
+      return {
+        id: session.id,
+        label: `${this.pageStart + index + 1} · ${providerLabel(session.agentProvider!)} · ${folder}${excerpt ? ` · ${excerpt}` : ""}`,
+        title: session.rowTitle,
+        description: formatAge(session.lastUsedMs, now),
+      };
+    });
     const remaining = all.length - (this.pageStart + page.length);
     if (!this.displayed.length) {
       // A menu with only Cancel on it is worse than saying so plainly. The row
       // stays — dropping it would end the phone's stream mid-use.
       this.pendingWire = null;
       this.notify("No sessions to delete", "Nothing is remembered yet. Open ＋ Agent setup to start one.");
+      // Only on a live stream (the last delete just finished): nothing else
+      // clears the indicator until a reconnect. On connect, index.ts snapshots
+      // the derived state right after this and would duplicate it.
+      if (send) emit(this.id, { type: "status", state: "idle", sessionId: this.id, provider: "codex" });
       return;
     }
     const wire = {

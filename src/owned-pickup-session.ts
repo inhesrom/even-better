@@ -12,7 +12,7 @@ import path from "node:path";
 import { parseAnswer } from "./owned-commands.js";
 import type { ExternalSessionCandidate } from "./owned-discovery.js";
 import { compactPrompt, formatAge, providerLabel } from "./owned-format.js";
-import { deferRowQuestion, primeRow } from "./owned-row-question.js";
+import { closeRowTurn, deferRowQuestion, primeRow } from "./owned-row-question.js";
 import type { OwnedSessionCatalog } from "./owned-session-catalog.js";
 import {
   SessionControlError,
@@ -73,8 +73,11 @@ export class OwnedPickupSession implements LiveSession {
 
   get state(): SessionState {
     // Never `awaiting` while an adopt is running: there is no menu to answer, and
-    // respondQuestion() would reject the answer anyway.
-    return this.adopting ? "busy" : "awaiting";
+    // respondQuestion() would reject the answer anyway. Awaiting is derived from
+    // the pending menu rather than assumed: a cancelled or empty picker has none,
+    // and a row that reads needs-input forever is the bug this fixed.
+    if (this.adopting) return "busy";
+    return this.pendingWire ? "awaiting" : "idle";
   }
 
   describe(): Promise<SessionDescriptor> {
@@ -101,6 +104,10 @@ export class OwnedPickupSession implements LiveSession {
 
   async respondQuestion(answer: string): Promise<void> {
     if (this.adopting) throw new SessionControlError("A session is being picked up.", 409);
+    // A cancelled row has no menu, and answering one that is gone would land in
+    // the unrecognized-answer branch and put the picker back — the loop Cancel
+    // exists to leave.
+    if (!this.pendingWire) throw new SessionControlError("No question is pending.", 409);
     const value = parseAnswer(answer).trim();
     switch (this.step) {
       case "pick":
@@ -150,11 +157,15 @@ export class OwnedPickupSession implements LiveSession {
   replayPending(): void {
     if (this.adopting || !this.pendingWire) return;
     clearTimeout(this.questionTimer ?? undefined);
+    // Fenced on the wire that was pending when the timer was armed: an answer
+    // landing inside the delay replaces or clears it, and firing the captured
+    // one would put a stale menu on a row that has moved on.
+    const wire = this.pendingWire;
     this.questionTimer = deferRowQuestion(
       this.id,
-      this.pendingWire,
+      wire,
       this.catalog.config.setupQuestionDelayMs,
-      () => !this.adopting,
+      () => !this.adopting && this.pendingWire === wire,
     );
   }
 
@@ -178,11 +189,15 @@ export class OwnedPickupSession implements LiveSession {
   private async answerPick(value: string): Promise<void> {
     if (!value || value.toLowerCase() === CANCEL.toLowerCase()) {
       this.ack(CANCEL);
-      this.notify("Nothing picked up", "Every session stays in its terminal.");
-      // Re-armed rather than left blank: this row has nowhere else to go, and a
-      // menu-less row is indistinguishable from a broken one.
+      // Cancel leaves the row, it does not re-arm it: re-emitting the picker was
+      // a menu with no way out, and going merely quiet left the user on a dead
+      // row. Close the turn, then hand the row to retire() — that ends the SSE
+      // stream (the only lever the protocol gives us to put the app back on the
+      // session list) and mints a replacement with a new id on the next poll.
+      this.pendingWire = null;
       this.pageStart = 0;
-      await this.askPick(true);
+      closeRowTurn(this.id, "Cancelled — nothing picked up.");
+      this.catalog.retire(this);
       return;
     }
     if (value.toLowerCase() === MORE.toLowerCase()) {
@@ -277,6 +292,10 @@ export class OwnedPickupSession implements LiveSession {
         "No sessions to pick up",
         "No recent Claude or Codex terminal session is inside WORKSPACE_ROOTS and not already here. Start one with the claude or codex CLI, or adjust WORKSPACE_ROOTS.",
       );
+      // Only on a live stream (the candidate list emptied under an open menu):
+      // nothing else clears the indicator until a reconnect. On connect, index.ts
+      // snapshots the derived state right after this and would duplicate it.
+      if (send) emit(this.id, { type: "status", state: "idle", sessionId: this.id, provider: "codex" });
       return;
     }
     const wire = {

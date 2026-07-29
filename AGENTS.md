@@ -60,8 +60,9 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   with no prompt lands idle and asks for one.
 - **`owned-manage-session.ts` / `owned-row-question.ts`** — the second synthetic
   row (**＋ Manage sessions**: pick → confirm → `catalog.forget`) and the prime +
-  deferral every synthetic row needs to get a menu rendered. That mechanism is one
-  measurement, not a preference, so it lives in one place rather than in each row.
+  deferral every synthetic row needs to get a menu rendered, plus the
+  `closeRowTurn` that ends such a turn. That mechanism is one measurement, not a
+  preference, so it lives in one place rather than in each row.
 - **`owned-pickup-session.ts` / `owned-discovery.ts`** — the third synthetic row
   (**＋ Pick up session**: pick → confirm → `catalog.adopt`) for taking over
   `claude`/`codex` sessions the user started in a terminal, and the read-only
@@ -222,6 +223,26 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   opens needs the deferral. Both halves live in `owned-row-question.ts` because
   every synthetic row depends on them and none can afford to drift.
   `assertPrimedQuestion` in `test-owned-server.ts` is the guard for all of them.
+- **A synthetic row's Cancel closes the turn *and* retires the row.** Both pickers
+  re-emitted themselves on Cancel — "a menu-less row is indistinguishable from a
+  broken one" — which on the glasses is a menu that cannot be dismissed: answer
+  Cancel, get the same list back. Merely going quiet then parked the user on an
+  empty row with no way back to the picker. Cancel acks, clears `pendingWire`,
+  calls `closeRowTurn` (`result` + `status: idle`) like Cancel on a bridge menu,
+  then `catalog.retire(this)` — which ends the row's SSE stream, the only lever
+  the protocol gives us to put the app back on the session list, and replaces the
+  row with one carrying a **new id**. The new id is load-bearing twice over: it
+  makes the app open a fresh stream (and so re-prime), and it makes the old id
+  unresolvable, so an EventSource reconnect cannot land back on a re-primed
+  picker. The replacement must be on the **first** `list()` after Cancel — the
+  poll the app makes while backing out — which `ensureManager` gives for free but
+  `ensurePickup`'s fire-and-forget probe does not, so `retire()` mints the pickup
+  row itself. A fake whose candidate scan resolves inline hides that entirely. `state` follows from the pending menu
+  (`awaiting` only when one exists) and an answer to a row with no menu is a 409 —
+  without that guard a stray second tap lands in the unrecognized-answer branch.
+  ADR 0006's "never torn down" is superseded for this one case; an `res.end()` the
+  user did not ask for is still hostile, which is why the empty-list row still
+  says so instead of vanishing.
 - **A question's option count is bounded, and the ceiling is unknown.** Eleven
   options (ten sessions + Cancel) were silently not drawn on a physical phone;
   four are fine. The signature is identical to the same-tick question above — no

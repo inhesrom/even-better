@@ -176,10 +176,18 @@ A second synthetic row, **＋ Manage sessions**, appears once at least one sessi
 is remembered and sorts directly after the wizard. It removes sessions and does
 nothing else: a prompt to it returns `409`, and it is never a `default()` target.
 Its questions are `owned-manage:<id>:pick` (remembered sessions oldest-first,
-labelled `<n> · Agent · folder`, plus **More sessions…** when a page remains, plus
-**Cancel**) and `owned-manage:<id>:confirm` (**Delete forever** / **Keep**).
+labelled `<n> · Agent · folder · excerpt` — the session's first prompt, so two
+sessions in one directory read apart — with an age description, plus **More
+sessions…** when a page remains, plus **Cancel**) and
+`owned-manage:<id>:confirm` (**Delete forever** / **Keep**).
 Deleting ends that session's SSE stream, so the app sees the row disappear on its
-next `/api/sessions` poll.
+next `/api/sessions` poll. **Cancel** leaves the row rather than re-emitting the
+picker: it acks, emits `result` ("Cancelled — nothing deleted.") and
+`status: idle`, then **ends the row's SSE stream and retires the row** — the
+protocol has no navigation event, so closing the stream is the only way to put
+the app back on the session list. A replacement row with a **new id** appears on
+the next `/api/sessions` poll and primes normally; the cancelled id is gone
+(`/status` → `404`), so a client still holding it cannot land back on the picker.
 
 A third synthetic row, **＋ Pick up session**, appears once a recent terminal
 `claude`/`codex` session is adoptable (ADR 0007) and sorts after the manage row.
@@ -194,7 +202,8 @@ speak, and the provider begins resuming in the background immediately. The next
 `/api/sessions` poll shows the same id retitled `Agent · folder · excerpt`;
 while candidates remain, a fresh **＋ Pick up session** row with a new id
 appears on a later poll, and after the last one none does. Like the manage row
-it rejects prompts with `409` and is never a `default()` target; the **No
+it rejects prompts with `409` and is never a `default()` target; its **Cancel**
+retires the row the same way ("Cancelled — nothing picked up."), and the **No
 sessions to pick up** notification covers a row whose candidates disappear
 beneath it.
 

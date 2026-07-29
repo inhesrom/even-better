@@ -575,24 +575,54 @@ test("the manage row deletes a remembered session over SSE, and DELETE does the 
     // The manage row is the wizard's twin: same prime, same deferral, same guard.
     await assertPrimedQuestion(base, manager.id, "pick");
 
+    let label: string | undefined;
     const stream = await openStream(base, manager.id);
     try {
       await waitFor("the delete menu", () => asked(stream, "pick") >= 1);
       const pick = stream.events.find((event) => event.toolUseId?.endsWith(":pick")) as
         | { questions?: Array<{ options: Array<{ label: string }> }> }
         | undefined;
-      const label = pick?.questions?.[0]?.options[0]?.label;
-      assert.ok(label, "expected a session option");
+      // Agent, folder and the session's own prompt excerpt — the same string the
+      // session list shows, so the option names a session rather than a directory.
+      label = pick?.questions?.[0]?.options[0]?.label;
+      assert.equal(label, `1 · Grok · ${path.basename(workspace)} · delete me`);
 
-      await answer(base, manager.id, label);
-      await waitFor("the confirm menu", () => asked(stream, "confirm") >= 1);
-      await answer(base, manager.id, "Delete forever");
-      await waitFor(
-        "the deletion notification",
-        () => stream.events.some((event) => event.title === "Session deleted"),
-      );
+      // Cancel leaves the row instead of re-arming the picker, which was a menu
+      // with no way out: the turn closes and the server ends the stream — the one
+      // lever the protocol gives us to put the app back on the session list.
+      await answer(base, manager.id, "Cancel");
+      await waitFor("the cancelled turn to close", () =>
+        stream.events.some((event) => event.type === "result"));
+      assert.equal(asked(stream, "pick"), 1, "Cancel must not re-ask");
+      await waitFor("the cancelled row's stream to end", () => stream.ended);
     } finally {
       stream.close();
+    }
+
+    // The cancelled row is gone, not merely quiet, so an app still holding its id
+    // cannot land back on it.
+    await api<{ error: string }>(
+      base, `/status?sessionId=${encodeURIComponent(manager.id)}`, {}, 404);
+    const relisted = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");
+    const fresh = manageRow(relisted.sessions);
+    assert.ok(fresh, "expected a replacement manage row");
+    assert.notEqual(fresh.id, manager.id, "the replacement carries a new id");
+    // A new id is what makes the app open a fresh stream, and the replacement
+    // primes and asks exactly like the first one.
+    await assertPrimedQuestion(base, fresh.id, "pick");
+
+    const rebuilt = await openStream(base, fresh.id);
+    try {
+      await waitFor("the rebuilt delete menu", () => asked(rebuilt, "pick") >= 1);
+      await answer(base, fresh.id, label!);
+      await waitFor("the confirm menu", () => asked(rebuilt, "confirm") >= 1);
+      await answer(base, fresh.id, "Delete forever");
+      await waitFor(
+        "the deletion notification",
+        () => rebuilt.events.some((event) => event.title === "Session deleted"),
+      );
+    } finally {
+      rebuilt.close();
     }
 
     const afterDelete = await api<{ sessions: SessionItem[] }>(base, "/sessions?provider=codex");

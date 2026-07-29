@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-27
+- Amended: 2026-07-29 (see Amendment)
 - Builds on: ADR 0005
 
 ## Context
@@ -94,3 +95,56 @@ up when nothing is open.
 - ADR 0005's failure signature recurs: the app rejects nothing and reports
   nothing, so any menu that does not render looks from the server exactly like one
   that does. Only a physical phone distinguishes them.
+
+## Amendment (2026-07-29)
+
+Two things above were wrong in use, both reported from the glasses.
+
+**Cancel had no exit.** The original build re-emitted the picker on Cancel — "the
+row has nowhere else to go, and a menu-less row is indistinguishable from a broken
+one." On the device that reads as a menu that cannot be dismissed: answering
+Cancel puts the same list straight back. The mistake was conflating *keep the row*
+with *keep a menu on it*.
+
+Cancel now terminalizes the turn the prime opened, the way Cancel does on every
+bridge menu (`finishTurn`): ack, `result`, `status: idle`, `pendingWire` cleared
+(`closeRowTurn`, in `owned-row-question.ts` beside the prime and the deferral for
+the same no-drift reason). `state` follows from the pending menu — `awaiting` only
+when one exists — which also fixes the empty-list row reading `awaiting` forever,
+and an answer to a row with no menu returns `409` instead of landing in the
+unrecognized-answer branch and re-arming it.
+
+Going quiet was not enough on its own: it left the user parked on a row with
+nothing on it and no way back into the picker. What Cancel has to mean is *leave
+the row*, and the protocol has no navigation event — the app owns the visual.
+Ending the row's SSE stream is the only lever, so `catalog.retire(row)` does that
+and drops the row, and a replacement with a **new id** takes its place. The new id
+matters as much as the stream end: it is what forces the app to open a fresh
+stream, and with it the prime and the menu, instead of holding a dead one. It also
+makes the loop unreachable — the cancelled id no longer resolves, so an
+EventSource reconnecting to it gets nothing rather than a re-primed picker.
+
+The replacement must exist on the *first* `list()` after Cancel — that is the poll
+the app makes as it backs out of the row, and a row that is not on it reads as
+gone. `ensureManager` mints synchronously and satisfies that for free;
+`ensurePickup` does not, because its discovery probe is fire-and-forget, so
+`retire()` mints the pickup replacement itself. (Measured on hardware: the manage
+row came back, the pickup row did not. The unit fake hid it by resolving its
+candidate scan inline — real discovery is filesystem I/O, and the fake now defers
+by a macrotask so the gap is visible to the suite.)
+
+That supersedes "the row is never torn down once created" (Decision, above). The
+reasoning behind that line survives intact: an `res.end()` the user did not ask
+for is still hostile, which is why the empty-list row still says **No sessions to
+delete** instead of vanishing mid-use, and why the turn is closed before the
+stream is. Cancel is the one case where the user asked to leave.
+
+**The pick label was too short.** `<n> · Agent · folder` named a directory, not a
+session; the distinguishing first-prompt excerpt sat in `description`, where the
+app does not surface it usefully. The label now carries it —
+`<n> · Agent · folder · excerpt`, mirroring the pickup row (ADR 0007), whose
+longer labels were already device-proven — and `description` carries the age
+alone. Option *count* remains the measured constraint; label length is not one.
+
+The pickup row had the identical Cancel branch, by inheritance, and got the same
+fix.
