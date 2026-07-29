@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import type {
+  AgentMode,
   OwnedAgent,
   OwnedAgentSink,
   OwnedAgentStartInfo,
@@ -80,6 +81,33 @@ function parseVersion(output: string): string | null {
 
 const SUPPORTED_CODEX_VERSIONS = new Set(["0.142.5", "0.145.0"]);
 
+/** Codex's own collaboration mode (`collaborationMode/list` advertises exactly
+ *  `plan` and `default`) plus the permission axis. Plan is both: the collaboration
+ *  mode is what makes the agent *plan*, and the read-only sandbox is the backstop
+ *  that makes it structurally unable to write if it tries anyway.
+ *
+ *  Field names are load-bearing. Runtime updates take `sandboxPolicy` — an
+ *  internally tagged object — while the plain-string `sandbox` field exists only
+ *  on `thread/start`. Sending `sandbox` here returns `ok` with no notification and
+ *  no change: silently ignored, measured on 0.145.0. */
+const CODEX_MODE: Record<AgentMode, { collaboration: "plan" | "default"; sandbox: Record<string, unknown>; approval: string }> = {
+  plan: { collaboration: "plan", sandbox: { type: "readOnly" }, approval: "on-request" },
+  normal: { collaboration: "default", sandbox: { type: "workspaceWrite" }, approval: "on-request" },
+  auto: { collaboration: "default", sandbox: { type: "workspaceWrite" }, approval: "never" },
+};
+
+/** Read Codex's confirmed settings back as a neutral mode. Order matters: a
+ *  read-only sandbox outranks the approval policy, since it is the stronger
+ *  constraint and the one Plan is defined by. */
+function neutralMode(settings: Record<string, unknown>): AgentMode | null {
+  const sandbox = isRecord(settings.sandboxPolicy) ? text(settings.sandboxPolicy.type) : "";
+  const collaboration = isRecord(settings.collaborationMode) ? text(settings.collaborationMode.mode) : "";
+  if (sandbox === "readOnly" || collaboration === "plan") return "plan";
+  if (settings.approvalPolicy === "never") return "auto";
+  if (!sandbox && !settings.approvalPolicy) return null;
+  return "normal";
+}
+
 function normalizedAnswer(question: OwnedQuestion, answer: string): string[] {
   let value: unknown = answer;
   try {
@@ -106,6 +134,8 @@ export class CodexOwnedAgent implements OwnedAgent {
   private pending = new Map<RequestId, PendingRpc>();
   private threadId = "";
   private turnId = "";
+  private model = "";
+  private currentMode: AgentMode = "normal";
   private active = false;
   private closing = false;
   private stderrTail = "";
@@ -168,6 +198,9 @@ export class CodexOwnedAgent implements OwnedAgent {
       if (!thread || typeof thread.id !== "string") throw new Error(`Codex returned an invalid ${method} response.`);
       this.threadId = thread.id;
       const model = text(started.model) || "Unknown";
+      // thread/settings/update requires a full collaborationMode payload, and its
+      // `settings.model` is mandatory — this is where that value comes from.
+      this.model = text(started.model);
       sink.event({ type: "model", model });
       return { nativeSessionId: this.threadId, model };
     } catch (error) {
@@ -195,6 +228,36 @@ export class CodexOwnedAgent implements OwnedAgent {
       this.active = false;
       throw error;
     }
+  }
+
+  /** `thread/settings/update` — a real runtime switch, confirmed by a
+   *  `thread/settings/updated` notification (verified on 0.145.0). Errors reject:
+   *  the thread is never restarted to force a mode, and the bridge reports the
+   *  session as unable to switch rather than gating the provider. */
+  async setMode(mode: AgentMode): Promise<void> {
+    if (!this.child || !this.threadId) throw new Error("Codex session ended; create another session.");
+    const target = CODEX_MODE[mode];
+    const permissions = { approvalPolicy: target.approval, sandboxPolicy: target.sandbox };
+    const collaboration = this.model
+      ? { collaborationMode: { mode: target.collaboration, settings: { model: this.model } } }
+      : {};
+    try {
+      await this.settingsUpdate({ ...permissions, ...collaboration });
+    } catch (error) {
+      // 0.142.5 is unverified for collaborationMode. The permission half is the part
+      // that actually constrains the agent, so apply it alone rather than losing the
+      // whole switch — and let a second failure surface as unavailable.
+      if (!Object.keys(collaboration).length) throw error;
+      await this.settingsUpdate(permissions);
+    }
+  }
+
+  private async settingsUpdate(params: Record<string, unknown>): Promise<void> {
+    await withTimeout(
+      this.request("thread/settings/update", { threadId: this.threadId, ...params }).then(() => undefined),
+      this.config.cancelTimeoutMs,
+      "Codex did not acknowledge the mode change.",
+    );
   }
 
   respondPermission(decision: string): Promise<void> {
@@ -421,6 +484,19 @@ export class CodexOwnedAgent implements OwnedAgent {
     if (!this.sink) return;
     if (method === "turn/started" && isRecord(params.turn) && typeof params.turn.id === "string") {
       this.turnId = params.turn.id;
+      return;
+    }
+    if (method === "thread/settings/updated" && isRecord(params.threadSettings)) {
+      // Provider truth for the mode marker: emitted after Codex applies a change,
+      // so it also carries changes we did not make.
+      const settings = params.threadSettings;
+      const model = text(settings.model);
+      if (model) this.model = model;
+      const mode = neutralMode(settings);
+      if (mode && mode !== this.currentMode) {
+        this.currentMode = mode;
+        this.sink.event({ type: "mode", mode });
+      }
       return;
     }
     if (method === "item/agentMessage/delta") {

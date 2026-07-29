@@ -34,8 +34,10 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - **`render.ts`** — pure `string→string` glasses transforms (table reflow, box
   strip). Applied before emit.
 - **`owned-commands.ts`** — pure matching of spoken/typed input against the
-  provider's advertised command list. Every heuristic for "which command did they
-  mean" lives here, the way screen artifacts live in `screen-timeline.ts`.
+  provider's advertised command list, plus `parseModeInput` for the one synthetic
+  (`/mode`, ADR 0008). Every heuristic for "which command did they mean" and "did
+  they ask for a mode" lives here, the way screen artifacts live in
+  `screen-timeline.ts`.
 - **`multiplexer.ts`** — the `Multiplexer` seam (pane I/O) + normalized
   `PaneStatus`. `index.ts` picks one backend at boot (`MUX` env, else auto) and
   everything reads it via `getMux()`. Status is normalized here so the bridge's
@@ -72,6 +74,8 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - **`owned-agent.ts` / `owned-session-bridge.ts`** — provider-neutral contract
   and common owned bridge. Provider adapters own only their native protocol;
   the common bridge owns public IDs, pacing, interactions, and wire events.
+  `AgentMode` (`plan|normal|auto`) and the optional `setMode?()` capability are
+  part of that contract — native mode ids stop at the seam (ADR 0008).
 - **`owned-workspaces.ts` / `owned-config.ts` / `owned-session-store.ts`** —
   realpath-enforced directory policy, MRU choices, atomic private persistence,
   leases, executable discovery, limits, and child configuration.
@@ -282,11 +286,32 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   the user's prompt did not trigger"; ADR 0005 found the real constraint is that
   the stream must first look like a turn and the question must not share a tick
   with a stream opening. Both features land on the same shape either way.)
-- **Commands are enumerated, never invented.** `OwnedAgent.commands()` is an
-  optional capability (like `Multiplexer.explain()`) and execution is passthrough
-  — `prompt("/name args")`, which Claude and Grok parse themselves. Codex
-  advertises nothing, so its prompts must stay byte-identical to the pre-command
-  path. All matching lives in `owned-commands.ts` and never in an adapter.
+- **Commands are enumerated, never invented — with one written-down carve-out.**
+  `OwnedAgent.commands()` is an optional capability (like `Multiplexer.explain()`)
+  and execution is passthrough — `prompt("/name args")`, which Claude and Grok
+  parse themselves. Codex advertises nothing, so its prompts must stay
+  byte-identical to the pre-command path. All matching lives in
+  `owned-commands.ts` and never in an adapter. The carve-out is `/mode`
+  (ADR 0008): a *bridge-level* synthetic, matched in `owned-commands.ts` like
+  everything else and dispatched to `OwnedAgent.setMode?()` — **never sent to a
+  provider as text**. Adapters still fabricate nothing, which is what the
+  invariant is actually for. Add a second synthetic only with the same
+  justification and its own ADR.
+- **Mode is provider truth, never what we asked for.** The bridge's `mode` event
+  fires only on Claude's `system/init` (the field is `permissionMode`, not `mode`)
+  or Codex's `thread/settings/updated`, so a mode the agent reached on its own is
+  reported too and a switch that silently did not apply cannot be drawn as if it
+  had. Codex's runtime update takes `sandboxPolicy` (an internally tagged object);
+  the plain-string `sandbox` field exists only on `thread/start` and is **silently
+  ignored** elsewhere — `ok`, no notification, no change. `collaborationMode`
+  needs its whole `{mode, settings:{model}}` payload or the request fails outright.
+  `codex app-server generate-json-schema` does **not** export
+  `thread/settings/update` even though it exists — probe the running server, do
+  not trust that bundle for what the app-server accepts.
+- **Mode matching is whole-prompt, and the asymmetry is the point.** A prompt that
+  merely contains "change to auto mode" must reach the agent untouched. A phrasing
+  we miss costs one confused answer from the agent; a prompt we steal is invisible
+  on the glasses.
 - **Claude's local commands need their own message cases.** `/usage`, `/cost` and
   `/context` bypass the query loop entirely and emit only
   `system/local_command_output`; `/compact` emits only `compact_boundary`.

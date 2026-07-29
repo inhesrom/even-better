@@ -6,6 +6,7 @@ import {
   isDestructive,
   parseAnswer,
   parseCommandInput,
+  parseModeInput,
   resolveCommand,
   suggestCommands,
 } from "../src/owned-commands.js";
@@ -82,6 +83,60 @@ test("dispatch text is the provider's own slash form", () => {
   assert.equal(commandText({ command: command("compact"), args: "" }), "/compact");
   assert.equal(commandText({ command: command("research"), args: "auth flow" }), "/research auth flow");
   assert.equal(commandText({ command: command("plugin:deploy"), args: "" }), "/plugin:deploy");
+});
+
+test("a named mode switches, spoken the ways people actually say it", () => {
+  const mode = (text: string): string | undefined => {
+    const parsed = parseModeInput(text);
+    return parsed?.kind === "switch" ? parsed.mode : undefined;
+  };
+  assert.equal(mode("change to auto mode"), "auto");
+  assert.equal(mode("switch to plan mode"), "plan");
+  assert.equal(mode("go to normal mode"), "normal");
+  assert.equal(mode("plan mode"), "plan");
+  assert.equal(mode("auto mode"), "auto");
+  assert.equal(mode("/mode plan"), "plan");
+  assert.equal(mode("slash mode auto"), "auto");
+  assert.equal(mode("set the mode to plan"), "plan");
+  assert.equal(mode("switch to auto"), "auto");
+  // Voice arrives capitalized and punctuated, and the templates are anchored.
+  assert.equal(mode("Change to Auto mode."), "auto");
+  assert.equal(mode("  switch to plan mode!  "), "plan");
+  // Synonyms fold onto the three neutral modes.
+  assert.equal(mode("default mode"), "normal");
+  assert.equal(mode("planning mode"), "plan");
+  assert.equal(mode("automatic mode"), "auto");
+});
+
+test("an unnamed or unrecognized mode opens the picker instead of guessing", () => {
+  assert.deepEqual(parseModeInput("mode"), { kind: "menu" });
+  assert.deepEqual(parseModeInput("/mode"), { kind: "menu" });
+  assert.deepEqual(parseModeInput("slash mode"), { kind: "menu" });
+  assert.deepEqual(parseModeInput("change the mode"), { kind: "menu" });
+  // Said "mode" outright but named something we do not know: ask, never guess.
+  assert.deepEqual(parseModeInput("switch to yolo mode"), { kind: "menu" });
+  assert.deepEqual(parseModeInput("/mode ludicrous"), { kind: "menu" });
+});
+
+// The one place this feature could eat a real prompt. On glasses a stolen prompt is
+// invisible: you spoke, the agent never heard it, and the mode changed instead.
+test("a prompt that merely mentions modes is never stolen", () => {
+  for (const prompt of [
+    "change to auto mode detection in the parser",
+    "switch to plan mode when the user asks, and document it",
+    "the auto mode flag is broken",
+    "explain plan mode",
+    "what mode am i in",
+    "add a normal mode to the state machine",
+    // No literal "mode", so an unknown target is far likelier to be a real prompt.
+    "switch to the auth branch",
+    "change to typescript",
+    "go to line 40",
+    "",
+    "compact the context",
+  ]) {
+    assert.equal(parseModeInput(prompt), null, `stole the prompt: ${JSON.stringify(prompt)}`);
+  }
 });
 
 test("answers arrive as a bare label or a JSON envelope", () => {

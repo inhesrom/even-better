@@ -85,3 +85,40 @@ test("Codex adapter accepts both verified schemas and resumes the persisted thre
     await agent.dispose();
   }
 });
+
+test("Codex switches mode through thread/settings/update and reports the confirmation", async () => {
+  const sink = new Sink();
+  const agent = new CodexOwnedAgent(cwd, config());
+  try {
+    await agent.start(sink);
+    await agent.setMode("plan");
+    const planned = await waitFor(sink, "mode");
+    assert.equal(planned.type === "mode" && planned.mode, "plan");
+
+    await agent.setMode("auto");
+    const auto = await waitFor(sink, "mode", 2);
+    assert.equal(auto.type === "mode" && auto.mode, "auto");
+
+    await agent.setMode("normal");
+    const normal = await waitFor(sink, "mode", 3);
+    assert.equal(normal.type === "mode" && normal.mode, "normal");
+  } finally {
+    await agent.dispose();
+  }
+});
+
+// Plan is Codex's own collaboration mode plus a read-only sandbox. A CLI that does
+// not know the first must still get the second: the sandbox is the half that
+// actually stops an edit, so losing the whole switch would be the worse failure.
+test("Codex falls back to the permission half when collaborationMode is unknown", async () => {
+  const sink = new Sink();
+  const agent = new CodexOwnedAgent(cwd, config({ FAKE_CODEX_NO_COLLAB: "1" }));
+  try {
+    await agent.start(sink);
+    await agent.setMode("plan");
+    const mode = await waitFor(sink, "mode");
+    assert.equal(mode.type === "mode" && mode.mode, "plan");
+  } finally {
+    await agent.dispose();
+  }
+});

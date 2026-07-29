@@ -6,7 +6,7 @@
 // The command list is always authoritative. Nothing here guesses at a name the
 // provider did not advertise.
 
-import type { OwnedCommand } from "./owned-agent.js";
+import type { AgentMode, OwnedCommand } from "./owned-agent.js";
 
 /** Commands that discard conversation state and cannot be undone from the glasses.
  *  Deliberately tiny and explicit: a user skill is just a prompt expansion, so the
@@ -105,6 +105,75 @@ export function isDestructive(command: OwnedCommand): boolean {
  *  is passthrough and no provider-specific execution path exists. */
 export function commandText(resolved: ResolvedCommand): string {
   return resolved.args ? `/${resolved.command.name} ${resolved.args}` : `/${resolved.command.name}`;
+}
+
+/** Spoken and typed spellings of the three modes. Small on purpose: an unknown
+ *  word is either a prompt we must not eat or a menu we can open, and both of
+ *  those are safe outcomes — guessing is not. */
+const MODE_WORDS: Record<string, AgentMode> = {
+  plan: "plan",
+  planning: "plan",
+  normal: "normal",
+  default: "normal",
+  ask: "normal",
+  auto: "auto",
+  automatic: "auto",
+};
+
+/** Every way to ask for a mode, anchored to the WHOLE prompt.
+ *
+ *  Anchoring is the entire safety property. A prompt that merely contains these
+ *  words — "change to auto mode detection in the parser" — matches nothing and
+ *  reaches the agent untouched. On glasses a stolen prompt is invisible: you
+ *  spoke, the agent never heard it, and something else happened instead. That is
+ *  this project's worst failure class, so the cost of a phrasing we miss (the
+ *  agent answers "I can't change my own mode") is deliberately the cheap side. */
+const MODE_TEMPLATES: Array<{ pattern: RegExp; explicit: boolean }> = [
+  // "mode", "/mode", "slash mode" — and the same with a verb in front.
+  { pattern: /^(?:(?:change|switch|set)\s+(?:the\s+)?)?(?:slash[\s-]+|\/)?mode$/, explicit: true },
+  // "/mode auto", "slash mode plan"
+  { pattern: /^(?:slash[\s-]+|\/)mode\s+([a-z]+)$/, explicit: true },
+  // "auto mode", "plan mode"
+  { pattern: /^([a-z]+)\s+mode$/, explicit: true },
+  // "change the mode to auto", "set mode to plan"
+  { pattern: /^(?:change|switch|set|put)\s+(?:the\s+)?mode\s+(?:in)?to\s+(?:the\s+)?([a-z]+)$/, explicit: true },
+  // "change to auto mode", "switch to plan mode", "go into normal mode"
+  { pattern: /^(?:change|switch|go|set|put)\s+(?:me|us|it|the\s+session)?\s*(?:in)?to\s+(?:the\s+)?([a-z]+)\s+mode$/, explicit: true },
+  // "switch to auto" — no literal "mode", so an unrecognized word is far more
+  // likely to be a real prompt ("switch to the auth branch") than a typo'd mode.
+  { pattern: /^(?:change|switch|go|set|put)\s+(?:me|us|it|the\s+session)?\s*(?:in)?to\s+(?:the\s+)?([a-z]+)$/, explicit: false },
+];
+
+export type ModeInput = { kind: "switch"; mode: AgentMode } | { kind: "menu" };
+
+/** Match a spoken or typed prompt against the mode templates.
+ *
+ *  `null` means "this is an ordinary prompt" and is the default for everything
+ *  the templates do not match exactly. A template that named the mode outright
+ *  switches; one that asked for a mode without naming a recognizable one opens
+ *  the picker instead of guessing. */
+export function parseModeInput(text: string): ModeInput | null {
+  const phrase = text
+    .trim()
+    .toLowerCase()
+    // Voice input arrives punctuated ("Change to auto mode.") and the templates are
+    // anchored, so trailing punctuation would defeat every one of them.
+    .replace(/[.!?,;:]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!phrase) return null;
+  for (const { pattern, explicit } of MODE_TEMPLATES) {
+    const match = pattern.exec(phrase);
+    if (!match) continue;
+    const word = match[1];
+    if (word === undefined) return { kind: "menu" };
+    const mode = MODE_WORDS[word];
+    if (mode) return { kind: "switch", mode };
+    // The prompt said "mode" but named something we do not know: ask rather than
+    // guess, and rather than send a mode-switch request to the agent as prose.
+    return explicit ? { kind: "menu" } : null;
+  }
+  return null;
 }
 
 /** The phone sends a question answer as either a bare label or a JSON envelope.

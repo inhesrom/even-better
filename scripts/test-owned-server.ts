@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -736,5 +736,74 @@ test("the pickup row adopts a terminal codex session, and the adopted row resume
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
+  }
+});
+
+test("a spoken mode switch runs end to end and is remembered on disk", async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), "even-better-owned-mode-"));
+  const home = path.join(workspace, ".even-better-state");
+  const child = startServer(workspace, home, "mixed", { CODEX_BIN: fakeCodex });
+  try {
+    const base = await waitForServer(child);
+    const sessionId = await newSessionPrompt(base, "first prompt");
+    await firstSseEvent(base, sessionId);
+    await answer(base, sessionId, "Codex");
+    await waitForMessage(base, sessionId, "user_question", 2);
+    await answer(base, sessionId, workspace);
+    // The retained first prompt runs on startup; clear the fixture's own blockers.
+    await waitForMessage(base, sessionId, "permission_request");
+    await api(base, "/permission-response", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, decision: "allow" }),
+    });
+    await waitForMessage(base, sessionId, "user_question", 3);
+    await answer(base, sessionId, "Deep");
+    await waitForMessage(base, sessionId, "result");
+
+    const stream = await openStream(base, sessionId);
+    try {
+      await api(base, "/prompt", {
+        method: "POST",
+        body: JSON.stringify({ sessionId, text: "change to plan mode" }),
+      }, 202);
+      await waitFor("the mode notification", () =>
+        stream.events.some((message) => message.title === "Mode: Plan"));
+      await waitFor("the mode turn to close", () =>
+        stream.events.some((message) => message.type === "result"));
+
+      // The picker marks the mode Codex confirmed, not the one we asked for.
+      await api(base, "/prompt", {
+        method: "POST",
+        body: JSON.stringify({ sessionId, text: "mode" }),
+      }, 202);
+      await waitFor("the mode picker", () =>
+        stream.events.some((message) => message.toolUseId === `owned-mode:${sessionId}`));
+      const picker = stream.events.find((message) => message.toolUseId === `owned-mode:${sessionId}`) as
+        | { questions?: Array<{ options: Array<{ label: string }> }> }
+        | undefined;
+      assert.deepEqual(picker?.questions?.[0]?.options.map((option) => option.label), [
+        "Plan · current",
+        "Normal",
+        "Auto",
+        "Cancel",
+      ]);
+      await answer(base, sessionId, "Cancel");
+      await waitFor("the picker turn to close", () =>
+        stream.events.filter((message) => message.type === "result").length === 2);
+      assert.equal(stream.ended, false);
+    } finally {
+      stream.close();
+    }
+
+    // Remembered, so resuming this session tomorrow cannot quietly come back able
+    // to edit. Read from disk rather than from the API: this is the durable half.
+    const stored = JSON.parse(await readFile(
+      path.join(home, "sessions", sessionId.slice("owned:".length), "metadata.json"),
+      "utf8",
+    )) as { mode?: string };
+    assert.equal(stored.mode, "plan");
+  } finally {
+    await stop(child);
+    await rm(workspace, { recursive: true, force: true });
   }
 });

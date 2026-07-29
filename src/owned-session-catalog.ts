@@ -4,7 +4,7 @@ import { ClaudeOwnedAgent } from "./claude-owned-agent.js";
 import { CodexOwnedAgent } from "./codex-owned-agent.js";
 import { GrokOwnedAgent } from "./grok-owned-agent.js";
 import type { GrokConfig } from "./grok-config.js";
-import type { OwnedAgent, OwnedAgentStartInfo } from "./owned-agent.js";
+import type { AgentMode, OwnedAgent, OwnedAgentStartInfo } from "./owned-agent.js";
 import { parseAnswer } from "./owned-commands.js";
 import type { OwnedConfig, OwnedProviderConfig } from "./owned-config.js";
 import {
@@ -392,6 +392,14 @@ class OwnedCatalogSession implements LiveSession {
     this.save(true);
   }
 
+  /** Follows provider truth, not user intent: the bridge only reports a mode the
+   *  provider confirmed, including one the agent changed on its own. */
+  onMode(mode: AgentMode): void {
+    if (!this.record || this.record.mode === mode) return;
+    this.record.mode = mode;
+    this.save(true);
+  }
+
   onAssistant(text: string): void {
     if (this.disposed || !this.record || !text.trim()) return;
     this.catalog.store.appendHistory(this.id, {
@@ -429,7 +437,7 @@ class OwnedCatalogSession implements LiveSession {
     }
     if (this.attachPromise) return this.attachPromise;
     const record = this.record!;
-    this.attachPromise = this.catalog.attach(this, record.agentProvider, record.cwd, record.nativeSessionId)
+    this.attachPromise = this.catalog.attach(this, record.agentProvider, record.cwd, record.nativeSessionId, record.mode)
       .then(({ bridge, nativeSessionId, model }) => {
         record.nativeSessionId = nativeSessionId;
         record.model = model || record.model;
@@ -928,8 +936,9 @@ export class OwnedSessionCatalog implements SessionCatalog {
     provider: ProviderId,
     cwd: string,
     nativeSessionId?: string,
+    mode?: AgentMode,
   ): Promise<{ bridge: OwnedSessionBridge; nativeSessionId: string; model: string }> {
-    const run = this.attachmentTail.then(() => this.attachNow(session, provider, cwd, nativeSessionId));
+    const run = this.attachmentTail.then(() => this.attachNow(session, provider, cwd, nativeSessionId, mode));
     this.attachmentTail = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -1013,6 +1022,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
     provider: ProviderId,
     cwd: string,
     nativeSessionId?: string,
+    mode?: AgentMode,
   ): Promise<{ bridge: OwnedSessionBridge; nativeSessionId: string; model: string }> {
     if (this.disposed) throw new SessionControlError("Owned session catalog is shutting down.", 503);
     // acquireLease() below recreates the session directory, so a delete that
@@ -1048,6 +1058,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
         model: (model) => session.onModel(model),
         assistant: (text) => session.onAssistant(text),
         activity: () => session.touch(),
+        mode: (next) => session.onMode(next),
         unavailable: () => {
           if (bridge) session.onUnavailable(bridge);
         },
@@ -1055,7 +1066,7 @@ export class OwnedSessionCatalog implements SessionCatalog {
       session.installStarting(bridge);
       let info: OwnedAgentStartInfo;
       try {
-        info = await bridge.start(nativeSessionId);
+        info = await bridge.start(nativeSessionId, mode);
       } finally {
         session.installStarting(null);
       }
