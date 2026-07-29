@@ -1,0 +1,50 @@
+name: Release
+
+# Tag push (v*) publishes a GitHub Release with the universal tarball.
+# workflow_dispatch is the dry run: identical build, artifact upload, no release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # Same gate as ci.yml — never release broken code.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+
+      - name: Build release tarball
+        env:
+          EXPECT_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: bash scripts/package-release.sh
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release/even-better-*.tar.gz release/SHA256SUMS \
+            --verify-tag --generate-notes
+
+      - name: Upload dry-run artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: even-better-release-dryrun
+          path: |
+            release/even-better-*.tar.gz
+            release/SHA256SUMS
