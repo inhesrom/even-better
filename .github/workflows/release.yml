@@ -4,7 +4,7 @@ name: Release
 # workflow_dispatch is the dry run: identical build, artifact upload, no release.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -35,16 +35,21 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+        # gh never infers prerelease from the tag name; without the flag an
+        # rc tag would publish a full release and become releases/latest —
+        # exactly what the installer serves.
         run: |
+          args=(--verify-tag --generate-notes)
+          case "$GITHUB_REF_NAME" in *-*) args+=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            release/even-better-*.tar.gz release/SHA256SUMS \
-            --verify-tag --generate-notes
+            release/even-better-*.tar.gz release/SHA256SUMS "${args[@]}"
 
       - name: Upload dry-run artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: even-better-release-dryrun
+          retention-days: 7
           path: |
             release/even-better-*.tar.gz
             release/SHA256SUMS

@@ -12,7 +12,7 @@ version="$(node -p "require('./package.json').version")"
 
 # src/cli.ts hardcodes VERSION separately from package.json; --version lies
 # after a bump unless they move together.
-grep -q "const VERSION = \"$version\"" src/cli.ts \
+grep -qF "const VERSION = \"$version\"" src/cli.ts \
   || { echo "error: src/cli.ts VERSION != package.json version ($version)" >&2; exit 1; }
 if [[ -n "${EXPECT_TAG:-}" && "$EXPECT_TAG" != "v$version" ]]; then
   echo "error: tag $EXPECT_TAG does not match package.json version v$version" >&2
@@ -49,15 +49,27 @@ chmod +x "$stage/dist/cli.js"
 # owned mode always spawns the user's PATH-resolved CLI via
 # pathToClaudeCodeExecutable. Dropping them is what keeps the tarball universal.
 rm -rf "$stage/node_modules/@anthropic-ai/claude-agent-sdk-"*
-if compgen -G "$stage/node_modules/@anthropic-ai/claude-agent-sdk-*" > /dev/null; then
-  echo "error: platform optionalDependencies leaked into the stage" >&2
-  exit 1
-fi
+# Positive check — an empty or misplaced install would pass a "nothing
+# leaked" guard but not this one.
+for pkg in "@anthropic-ai/claude-agent-sdk" "@agentclientprotocol/sdk" express zod; do
+  if [[ ! -d "$stage/node_modules/$pkg" ]]; then
+    echo "error: staged install is missing $pkg" >&2
+    exit 1
+  fi
+done
 node "$stage/dist/cli.js" --help > /dev/null
 
 tarball="even-better-v$version.tar.gz"
-tar -czf "release/$tarball" -C release/stage even-better
-(cd release && { sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball"; } > SHA256SUMS)
+# COPYFILE_DISABLE keeps macOS bsdtar from embedding AppleDouble entries.
+COPYFILE_DISABLE=1 tar -czf "release/$tarball" -C release/stage even-better
+if command -v sha256sum > /dev/null 2>&1; then
+  (cd release && sha256sum "$tarball" > SHA256SUMS)
+elif command -v shasum > /dev/null 2>&1; then
+  (cd release && shasum -a 256 "$tarball" > SHA256SUMS)
+else
+  echo "error: no sha256 tool found" >&2
+  exit 1
+fi
 
 # Well under 50MB with optionals omitted; past it means they snuck back in.
 size=$(wc -c < "release/$tarball")
